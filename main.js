@@ -1,8 +1,15 @@
 import * as UI from './ui.js';
 
 // --- State Management ---
-let requests = []; 
-let selectedRequestIndex = -1;
+let allRequests = []; 
+let selectedRequestUrl = null; // Use URL as a stable identifier
+let filters = {
+    keyword: '',
+    method: '',
+    status: '',
+    type: 'all'
+};
+const KNOWN_TYPES = ['xhr', 'script', 'stylesheet', 'image', 'font', 'document'];
 
 // --- DOM Element References ---
 const clearButton = document.getElementById('clear-button');
@@ -15,6 +22,10 @@ const urlInput = document.getElementById('request-url');
 const methodSelect = document.getElementById('request-method');
 const resizer = document.getElementById('resizer');
 const leftPane = document.getElementById('left-pane');
+const filterKeywordInput = document.getElementById('filter-keyword');
+const filterMethodSelect = document.getElementById('filter-method');
+const filterStatusInput = document.getElementById('filter-status');
+const filterTypeContainer = document.getElementById('filter-type-container');
 
 // --- Initialization ---
 function init() {
@@ -26,9 +37,9 @@ function init() {
 // --- Event Handlers ---
 function setupEventListeners() {
     clearButton.addEventListener('click', () => {
-        requests = [];
-        selectedRequestIndex = -1;
-        UI.renderRequestList(requests, selectedRequestIndex, handleRequestSelection);
+        allRequests = [];
+        selectedRequestUrl = null;
+        applyFiltersAndRender();
         UI.showWelcomeMessage();
     });
 
@@ -36,24 +47,73 @@ function setupEventListeners() {
     formatHeadersBtn.addEventListener('click', () => UI.formatJSONTextarea(headersTextarea));
     formatBodyBtn.addEventListener('click', () => UI.formatJSONTextarea(bodyTextarea));
     
+    // Filter listeners
+    filterKeywordInput.addEventListener('keyup', () => {
+        filters.keyword = filterKeywordInput.value.toLowerCase();
+        applyFiltersAndRender();
+    });
+    filterMethodSelect.addEventListener('change', () => {
+        filters.method = filterMethodSelect.value;
+        applyFiltersAndRender();
+    });
+    filterStatusInput.addEventListener('keyup', () => {
+        filters.status = filterStatusInput.value;
+        applyFiltersAndRender();
+    });
+    filterTypeContainer.addEventListener('click', (e) => {
+        const button = e.target.closest('.type-filter-btn');
+        if (button) {
+            filters.type = button.dataset.type;
+            UI.updateActiveTypeFilter(button);
+            applyFiltersAndRender();
+        }
+    });
+
     setupResizerEvents();
 }
 
 function handleRequest(request) {
     if (request.request.url.startsWith('http')) {
-        requests.push(request);
-        UI.renderRequestList(requests, selectedRequestIndex, handleRequestSelection);
+        allRequests.push(request);
+        applyFiltersAndRender();
     }
 }
 
-function handleRequestSelection(index) {
-    selectedRequestIndex = index;
-    const requestData = requests[index];
-    
-    UI.showEditor();
-    UI.populateEditor(requestData);
-    UI.renderRequestList(requests, selectedRequestIndex, handleRequestSelection);
+function handleRequestSelection(index, url) {
+    selectedRequestUrl = url;
+    const originalIndex = allRequests.findIndex(req => req.request.url === url);
+
+    if (originalIndex !== -1) {
+        const requestData = allRequests[originalIndex];
+        UI.showEditor();
+        UI.populateEditor(requestData);
+        applyFiltersAndRender(); 
+    }
 }
+
+function applyFiltersAndRender() {
+    let filteredRequests = [...allRequests];
+
+    if (filters.keyword) {
+        filteredRequests = filteredRequests.filter(req => req.request.url.toLowerCase().includes(filters.keyword));
+    }
+    if (filters.method) {
+        filteredRequests = filteredRequests.filter(req => req.request.method === filters.method);
+    }
+    if (filters.status) {
+        filteredRequests = filteredRequests.filter(req => String(req.response.status).startsWith(filters.status));
+    }
+    if (filters.type && filters.type !== 'all') {
+        if (filters.type === 'other') {
+            filteredRequests = filteredRequests.filter(req => !KNOWN_TYPES.includes(req._resourceType));
+        } else {
+            filteredRequests = filteredRequests.filter(req => req._resourceType === filters.type);
+        }
+    }
+    
+    UI.renderRequestList(filteredRequests, selectedRequestUrl, handleRequestSelection);
+}
+
 
 async function handleResend() {
     resendButton.disabled = true;
@@ -104,7 +164,6 @@ function setupResizerEvents() {
         const newLeftWidth = e.clientX;
         const totalWidth = document.body.clientWidth;
 
-        // Apply constraints
         if (newLeftWidth > 250 && newLeftWidth < (totalWidth * 0.8)) {
             leftPane.style.width = `${newLeftWidth}px`;
         }

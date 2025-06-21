@@ -17,18 +17,22 @@ const elements = {
     tabButtons: document.querySelectorAll('.tab-item'),
     tabContents: document.querySelectorAll('.tab-content'),
     
+    // Type Filter Buttons
+    typeFilterContainer: document.getElementById('filter-type-container'),
+
     // Tab content areas
     headersContent: document.getElementById('response-headers-content'),
     previewContent: document.getElementById('response-preview-content'),
     rawResponseContent: document.getElementById('response-raw-content'),
 };
 
-export function renderRequestList(requests, selectedIndex, onSelectCallback) {
+export function renderRequestList(requests, selectedUrl, onSelectCallback) {
     elements.requestList.innerHTML = '';
     requests.forEach((req, index) => {
         const item = document.createElement('div');
         item.className = 'request-item p-2 cursor-pointer flex items-center space-x-3';
-        if (index === selectedIndex) {
+        // Check URL to maintain selection across filters
+        if (req.request.url === selectedUrl) {
             item.classList.add('selected');
         }
         
@@ -45,10 +49,13 @@ export function renderRequestList(requests, selectedIndex, onSelectCallback) {
         item.appendChild(method);
         item.appendChild(url);
         
-        item.addEventListener('click', () => onSelectCallback(index));
+        item.addEventListener('click', () => onSelectCallback(index, req.request.url));
         elements.requestList.appendChild(item);
     });
-    elements.requestList.scrollTop = elements.requestList.scrollHeight;
+    // Don't autoscroll if a selection is active, to avoid jarring jumps
+    if (!selectedUrl) {
+        elements.requestList.scrollTop = elements.requestList.scrollHeight;
+    }
 }
 
 export function populateEditor(requestData) {
@@ -95,7 +102,7 @@ export function updateResponseView(response, responseBody) {
     }
     
     // Raw Response Tab
-    elements.rawResponseContent.textContent = responseBody || '(No response body)';
+    elements.rawResponseContent.querySelector('pre').textContent = responseBody || '(No response body)';
 }
 
 export function showWelcomeMessage() {
@@ -132,6 +139,13 @@ export function setupTabEvents() {
         const activeContentId = clickedTab.getAttribute('data-tab');
         document.getElementById(activeContentId).classList.add('active');
     });
+}
+
+export function updateActiveTypeFilter(clickedButton) {
+    elements.typeFilterContainer.querySelectorAll('.type-filter-btn').forEach(btn => {
+        btn.classList.remove('active');
+    });
+    clickedButton.classList.add('active');
 }
 
 function getMethodColor(method) {
