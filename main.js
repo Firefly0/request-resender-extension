@@ -69,6 +69,7 @@ function setupEventListeners() {
         }
     });
 
+    
     setupResizerEvents();
 }
 
