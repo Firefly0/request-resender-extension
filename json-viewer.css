@@ -1,0 +1,84 @@
+/* --- JSON Tree Viewer Styles --- */
+.json-viewer {
+    font-family: "Menlo", "Consolas", "Courier New", monospace;
+    font-size: 13px;
+}
+
+.json-viewer .property {
+    display: flex;
+    padding-left: 20px;
+    /* Base indentation */
+}
+
+.json-viewer .toggle {
+    cursor: pointer;
+    user-select: none;
+    position: absolute;
+    left: 0;
+    top: 1px;
+    width: 20px;
+    text-align: center;
+    color: #9e9e9e;
+}
+
+.json-viewer .toggle::before {
+    content: '▶';
+    /* Collapsed state */
+    display: inline-block;
+    transition: transform 0.1s ease-out;
+}
+
+.json-viewer .toggle.expanded::before {
+    transform: rotate(90deg);
+    /* Expanded state */
+}
+
+.json-viewer .key {
+    color: #c586c0;
+    /* Magenta for keys */
+    margin-right: 8px;
+}
+
+.json-viewer .value {
+    color: #9cdcfe;
+    /* Light blue for strings */
+}
+
+.json-viewer .value.string {
+    color: #ce9178;
+    /* Orange for strings */
+}
+
+.json-viewer .value.number {
+    color: #b5cea8;
+    /* Light green for numbers */
+}
+
+.json-viewer .value.boolean {
+    color: #569cd6;
+    /* Blue for booleans */
+}
+
+.json-viewer .value.null {
+    color: #808080;
+    /* Gray for null */
+}
+
+.json-viewer .collapsible {
+    position: relative;
+}
+
+.json-viewer .nested-content {
+    display: none;
+    /* Collapsed by default */
+}
+
+.json-viewer .nested-content.expanded {
+    display: block;
+    /* Show when expanded */
+}
+
+.json-viewer .bracket {
+    color: #ffd700;
+    /* Yellow for brackets/braces */
+}
