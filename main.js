@@ -1,67 +1,80 @@
-import * as UI from './ui.js';
+import * as UI from "./ui.js";
+import * as Editor from "./interactive-editor.js";
+import { generateCurlCommand, copyToClipboard } from "./utils.js";
 
-// --- State Management ---
-let allRequests = []; 
-let selectedRequestUrl = null; // Use URL as a stable identifier
-let filters = {
-    keyword: '',
-    method: '',
-    status: '',
-    type: 'all'
+let allRequests = [];
+let selectedRequestUrl = null;
+let filters = { keyword: "", method: "", status: "", type: "all" };
+const KNOWN_TYPES = [
+    "xhr",
+    "script",
+    "stylesheet",
+    "image",
+    "font",
+    "document",
+];
+
+const DOMElements = {
+    clearButton: document.getElementById("clear-button"),
+    resendButton: document.getElementById("resend-button"),
+    copyCurlBtn: document.getElementById("copy-curl-btn"),
+    headersEditor: document.getElementById("interactive-headers-editor"),
+    bodyTextarea: document.getElementById("request-body"),
+    urlInput: document.getElementById("request-url"),
+    methodSelect: document.getElementById("request-method"),
+    resizer: document.getElementById("resizer"),
+    leftPane: document.getElementById("left-pane"),
+    filterKeywordInput: document.getElementById("filter-keyword"),
+    filterMethodSelect: document.getElementById("filter-method"),
+    filterStatusInput: document.getElementById("filter-status"),
+    filterTypeContainer: document.getElementById("filter-type-container"),
 };
-const KNOWN_TYPES = ['xhr', 'script', 'stylesheet', 'image', 'font', 'document'];
 
-// --- DOM Element References ---
-const clearButton = document.getElementById('clear-button');
-const resendButton = document.getElementById('resend-button');
-const formatHeadersBtn = document.getElementById('format-headers-btn');
-const formatBodyBtn = document.getElementById('format-body-btn');
-const headersTextarea = document.getElementById('request-headers');
-const bodyTextarea = document.getElementById('request-body');
-const urlInput = document.getElementById('request-url');
-const methodSelect = document.getElementById('request-method');
-const resizer = document.getElementById('resizer');
-const leftPane = document.getElementById('left-pane');
-const filterKeywordInput = document.getElementById('filter-keyword');
-const filterMethodSelect = document.getElementById('filter-method');
-const filterStatusInput = document.getElementById('filter-status');
-const filterTypeContainer = document.getElementById('filter-type-container');
-
-// --- Initialization ---
 function init() {
     UI.setupTabEvents();
     setupEventListeners();
     chrome.devtools.network.onRequestFinished.addListener(handleRequest);
 }
 
-// --- Event Handlers ---
 function setupEventListeners() {
-    clearButton.addEventListener('click', () => {
+    DOMElements.clearButton.addEventListener("click", () => {
         allRequests = [];
         selectedRequestUrl = null;
         applyFiltersAndRender();
         UI.showWelcomeMessage();
     });
 
-    resendButton.addEventListener('click', handleResend);
-    formatHeadersBtn.addEventListener('click', () => UI.formatJSONTextarea(headersTextarea));
-    formatBodyBtn.addEventListener('click', () => UI.formatJSONTextarea(bodyTextarea));
-    
-    // Filter listeners
-    filterKeywordInput.addEventListener('keyup', () => {
-        filters.keyword = filterKeywordInput.value.toLowerCase();
+    DOMElements.resendButton.addEventListener("click", handleResend);
+
+    DOMElements.copyCurlBtn.addEventListener("click", () => {
+        if (!selectedRequestUrl) return;
+        const requestData = allRequests.find(
+            (req) => req.request.url === selectedRequestUrl
+        );
+        const headers = Editor.getEditorData(DOMElements.headersEditor);
+        const body = DOMElements.bodyTextarea.value;
+        const curlCommand = generateCurlCommand(requestData, headers, body);
+        copyToClipboard(curlCommand);
+    });
+
+    const filterInputs = [
+        DOMElements.filterKeywordInput,
+        DOMElements.filterStatusInput,
+    ];
+    filterInputs.forEach((input) =>
+        input.addEventListener("keyup", () => {
+            filters[input.id.split("-")[1]] = input.value.toLowerCase();
+            applyFiltersAndRender();
+        })
+    );
+
+    DOMElements.filterMethodSelect.addEventListener("change", () => {
+        filters.method = DOMElements.filterMethodSelect.value;
         applyFiltersAndRender();
     });
-    filterMethodSelect.addEventListener('change', () => {
-        filters.method = filterMethodSelect.value;
-        applyFiltersAndRender();
-    });
-    filterStatusInput.addEventListener('keyup', () => {
-        filters.status = filterStatusInput.value;
-        applyFiltersAndRender();
-    });
-    filterTypeContainer.addEventListener('click', (e) => {
-        const button = e.target.closest('.type-filter-btn');
+
+    DOMElements.filterTypeContainer.addEventListener("click", (e) => {
+        const button = e.target.closest(".type-filter-btn");
         if (button) {
             filters.type = button.dataset.type;
             UI.updateActiveTypeFilter(button);
@@ -69,112 +82,96 @@ function setupEventListeners() {
         }
     });
 
-    
     setupResizerEvents();
 }
 
 function handleRequest(request) {
-    if (request.request.url.startsWith('http')) {
+    if (request.request.url.startsWith("http")) {
         allRequests.push(request);
         applyFiltersAndRender();
     }
 }
 
-function handleRequestSelection(index, url) {
+function handleRequestSelection(url) {
     selectedRequestUrl = url;
-    const originalIndex = allRequests.findIndex(req => req.request.url === url);
-
-    if (originalIndex !== -1) {
-        const requestData = allRequests[originalIndex];
+    const requestData = allRequests.find((req) => req.request.url === url);
+    if (requestData) {
         UI.showEditor();
         UI.populateEditor(requestData);
-        applyFiltersAndRender(); 
+        applyFiltersAndRender();
     }
 }
 
 function applyFiltersAndRender() {
-    let filteredRequests = [...allRequests];
-
-    if (filters.keyword) {
-        filteredRequests = filteredRequests.filter(req => req.request.url.toLowerCase().includes(filters.keyword));
-    }
-    if (filters.method) {
-        filteredRequests = filteredRequests.filter(req => req.request.method === filters.method);
-    }
-    if (filters.status) {
-        filteredRequests = filteredRequests.filter(req => String(req.response.status).startsWith(filters.status));
-    }
-    if (filters.type && filters.type !== 'all') {
-        if (filters.type === 'other') {
-            filteredRequests = filteredRequests.filter(req => !KNOWN_TYPES.includes(req._resourceType));
+    let filtered = [...allRequests];
+    if (filters.keyword)
+        filtered = filtered.filter((r) =>
+            r.request.url.toLowerCase().includes(filters.keyword)
+        );
+    if (filters.method)
+        filtered = filtered.filter((r) => r.request.method === filters.method);
+    if (filters.status)
+        filtered = filtered.filter((r) =>
+            String(r.response.status).startsWith(filters.status)
+        );
+    if (filters.type !== "all") {
+        if (filters.type === "other") {
+            filtered = filtered.filter(
+                (r) => !KNOWN_TYPES.includes(r._resourceType)
+            );
         } else {
-            filteredRequests = filteredRequests.filter(req => req._resourceType === filters.type);
+            filtered = filtered.filter((r) => r._resourceType === filters.type);
         }
     }
-    
-    UI.renderRequestList(filteredRequests, selectedRequestUrl, handleRequestSelection);
+    UI.renderRequestList(filtered, selectedRequestUrl, handleRequestSelection);
 }
 
-
 async function handleResend() {
-    resendButton.disabled = true;
-    resendButton.textContent = 'Sending...';
+    DOMElements.resendButton.disabled = true;
+    DOMElements.resendButton.textContent = "Sending...";
     UI.showResponseSection();
 
     const requestPayload = {
-        url: urlInput.value,
-        method: methodSelect.value,
-        headers: {},
-        body: bodyTextarea.value.trim() === '' ? null : bodyTextarea.value,
+        url: DOMElements.urlInput.value,
+        method: DOMElements.methodSelect.value,
+        headers: Editor.getEditorData(DOMElements.headersEditor),
+        body:
+            DOMElements.bodyTextarea.value.trim() === ""
+                ? null
+                : DOMElements.bodyTextarea.value,
     };
 
-    headersTextarea.value.split('\n').forEach(line => {
-        const parts = line.split(':');
-        if (parts.length >= 2) {
-            const key = parts[0].trim();
-            const value = parts.slice(1).join(':').trim();
-            if (key) requestPayload.headers[key] = value;
-        }
-    });
-
     try {
-        const response = await fetch(requestPayload.url, { 
-            method: requestPayload.method, 
-            headers: requestPayload.headers, 
-            body: requestPayload.body 
-        });
+        const response = await fetch(requestPayload.url, { ...requestPayload });
         const responseBody = await response.text();
         UI.updateResponseView(response, responseBody);
     } catch (error) {
         console.error("Resend Error:", error);
     } finally {
-        resendButton.disabled = false;
-        resendButton.textContent = 'Resend Request';
+        DOMElements.resendButton.disabled = false;
+        DOMElements.resendButton.textContent = "Resend Request";
     }
 }
 
-// --- Resizer Logic ---
 function setupResizerEvents() {
-    resizer.addEventListener('mousedown', function(e) {
+    DOMElements.resizer.addEventListener("mousedown", (e) => {
         e.preventDefault();
-        document.addEventListener('mousemove', handleMouseMove);
-        document.addEventListener('mouseup', handleMouseUp);
+        document.addEventListener("mousemove", handleMouseMove);
+        document.addEventListener("mouseup", handleMouseUp);
     });
 
     function handleMouseMove(e) {
         const newLeftWidth = e.clientX;
         const totalWidth = document.body.clientWidth;
-
-        if (newLeftWidth > 250 && newLeftWidth < (totalWidth * 0.8)) {
-            leftPane.style.width = `${newLeftWidth}px`;
+        if (newLeftWidth > 300 && newLeftWidth < totalWidth * 0.8) {
+            DOMElements.leftPane.style.width = `${newLeftWidth}px`;
         }
     }
 
     function handleMouseUp() {
-        document.removeEventListener('mousemove', handleMouseMove);
-        document.removeEventListener('mouseup', handleMouseUp);
+        document.removeEventListener("mousemove", handleMouseMove);
+        document.removeEventListener("mouseup", handleMouseUp);
     }
 }
 
-// --- Start the app ---
 init();

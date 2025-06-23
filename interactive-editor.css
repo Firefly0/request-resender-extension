@@ -1,0 +1,58 @@
+.interactive-editor {
+    display: flex;
+    flex-direction: column;
+}
+
+.editor-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+    border-bottom: 1px solid #303134; /* Slightly darker border */
+}
+
+.editor-row:last-child {
+    border-bottom: none;
+}
+
+.editor-cell {
+    flex: 1;
+    padding: 4px 6px;
+    outline: none;
+    white-space: pre-wrap;
+    word-break: break-all;
+    min-height: 24px;
+}
+
+.editor-cell:focus {
+    background-color: #3c4043;
+    box-shadow: 0 0 0 1px var(--highlight-color) inset;
+    border-radius: 2px;
+}
+
+.editor-actions {
+    display: flex;
+    align-items: center;
+}
+
+.action-btn {
+    cursor: pointer;
+    background: none;
+    border: none;
+    color: #9aa0a6;
+    padding: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+}
+
+.action-btn:hover {
+    color: var(--text-color);
+    background-color: #3c4043;
+}
+
+.add-row-btn {
+    margin-top: 8px;
+    align-self: flex-start;
+}

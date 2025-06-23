@@ -16,7 +16,6 @@ body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     font-size: 13px;
     overflow: hidden;
-    /* Prevent the main body from scrolling */
 }
 
 .main-container {
@@ -25,16 +24,12 @@ body {
 }
 
 .left-pane {
-    width: 35%;
-    /* Initial width */
-    min-width: 250px;
-    /* Constraint */
+    width: 40%;
+    min-width: 300px;
     max-width: 80%;
-    /* Constraint */
     display: flex;
     flex-direction: column;
     flex-shrink: 0;
-    /* Prevent left pane from shrinking automatically */
 }
 
 .left-pane .scrollable-list {
@@ -62,7 +57,6 @@ body {
     font-size: 12px;
 }
 
-/* New Type Filter Button Styles */
 .type-filter-buttons {
     display: flex;
     gap: 6px;
@@ -114,6 +108,77 @@ body {
     overflow-y: auto;
 }
 
+/* Redesigned Request List Item */
+.request-item {
+    display: grid;
+    grid-template-columns: 40px 1fr 50px;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.request-item:hover {
+    background-color: var(--hover-bg-color);
+}
+
+.request-item.selected {
+    background-color: var(--selected-bg-color) !important;
+}
+
+.request-item .method-badge {
+    font-weight: 700;
+    text-align: left;
+}
+
+.request-item .url-details {
+    overflow: hidden;
+}
+
+.request-item .url-name {
+    color: var(--text-color);
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.request-item .url-path {
+    color: #9aa0a6;
+    font-size: 11px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.status-badge {
+    font-size: 12px;
+    font-weight: 500;
+    text-align: right;
+}
+
+.status-badge.ok {
+    color: #b5cea8;
+}
+
+.status-badge.error {
+    color: #f28b82;
+}
+
+.status-badge.redirect {
+    color: #fca130;
+}
+
+/* General UI */
+.editor-section-header {
+    font-size: 14px;
+    font-weight: 500;
+    margin-top: 16px;
+    margin-bottom: 8px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border-color);
+}
+
 .editor-label {
     color: #bdc1c6;
     font-weight: 500;
@@ -121,18 +186,6 @@ body {
     display: flex;
     justify-content: space-between;
     align-items: center;
-}
-
-.format-btn {
-    font-size: 11px;
-    color: var(--highlight-color);
-    cursor: pointer;
-    opacity: 0.8;
-}
-
-.format-btn:hover {
-    opacity: 1;
-    text-decoration: underline;
 }
 
 ::-webkit-scrollbar {
@@ -150,29 +203,6 @@ body {
 
 ::-webkit-scrollbar-thumb:hover {
     background: #9aa0a6;
-}
-
-.request-item {
-    border-bottom: 1px solid var(--border-color);
-}
-
-.request-item:hover {
-    background-color: var(--hover-bg-color);
-}
-
-.request-item.selected {
-    background-color: var(--selected-bg-color);
-    border-left: 3px solid var(--highlight-color);
-    padding-left: 9px;
-}
-
-.method-badge {
-    font-size: 11px;
-    font-weight: 700;
-    padding: 2px 6px;
-    border-radius: 4px;
-    color: white;
-    flex-shrink: 0;
 }
 
 input, select, textarea {
