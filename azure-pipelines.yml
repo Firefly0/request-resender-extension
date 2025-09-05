@@ -1,30 +1,26 @@
 trigger: none
 pr: none
 
-name: gateway-probe-$(Date:yyyyMMdd)$(Rev:.r)
+name: "gateway-probe-$(Date:yyyyMMdd)$(Rev:.r)"
 
 stages:
 - stage: Probe
   displayName: Gateway Probes
   jobs:
 
-  # ────────────────────────────────────────────────────────────────────────────
-  # 1) LINUX VM PROBE (no installs)
-  # ────────────────────────────────────────────────────────────────────────────
+  # 1) Linux VM (no installs)
   - job: Linux_VM_GatewayProbe
     displayName: Linux (VM) gateway probe
-    pool:
-      vmImage: 'ubuntu-latest'
+    pool: { vmImage: 'ubuntu-latest' }
     steps:
     - bash: |
         set -Eeuo pipefail
 
-        # Find default GW from /proc/net/route (avoids iproute2 dependency)
+        # Compute gateway without extra tools
         GWH="$(awk '$1!="Iface" && $2=="00000000" {print $3; exit}' /proc/net/route || true)"
         hex2ip() { printf "%d.%d.%d.%d" 0x${1:6:2} 0x${1:4:2} 0x${1:2:2} 0x${1:0:2}; }
-        GW="$( [ -n "$GWH" ] && hex2ip "$GWH" || true )"
+        GW="$( [ -n "${GWH:-}" ] && hex2ip "$GWH" || true )"
         if [ -z "${GW:-}" ]; then
-          # Fallback if needed
           GW="$(ip route 2>/dev/null | awk '/default/ {print $3; exit}')"
         fi
         echo "GW=$GW"
@@ -32,44 +28,44 @@ stages:
         check_port() {
           local p="$1"
           if timeout 1 bash -lc "exec 3<>/dev/tcp/$GW/$p" 2>/dev/null; then
-            echo "open:$p"
-            exec 3>&- 3<&- || true
+            echo "open:$p"; exec 3>&- 3<&- || true
           else
             echo "closed:$p"
           fi
         }
 
-        # Port scan
+        http_v2() {
+          local host="$1" port="$2"
+          if timeout 2 bash -lc "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then
+            printf 'GET /v2/ HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$host" >&3
+            head -n1 <&3 || true
+            exec 3>&- 3<&- || true
+          else
+            echo "connection-refused"
+          fi
+        }
+
         RESULTS="$(mktemp)"
         {
           echo "## Linux (VM) gateway probe"
-          echo ""
+          echo
           echo "**Gateway:** $GW"
-          echo ""
+          echo
           echo "**Ports:**"
           for p in 5000 5001 2375 2376 80 443 8080; do
             echo "- $(check_port "$p")"
           done
-
-          echo ""
+          echo
           echo "--- HTTP /v2/ ---"
-          # Try curl first (available on VM), else raw TCP as fallback
-          if command -v curl >/dev/null 2>&1; then
-            curl -fsS -m 2 -i "http://$GW:5000/v2/" | head -n1 || echo "timeout"
-          else
-            timeout 2 bash -lc "exec 3<>/dev/tcp/$GW/5000; printf 'GET /v2/ HTTP/1.1\r\nHost: $GW\r\nConnection: close\r\n\r\n' >&3; head -n1 <&3; exec 3>&- 3<&-" || echo "timeout"
-          fi
-
-          echo ""
+          http_v2 "$GW" 5000
+          echo
           echo "--- HTTPS /v2/ ---"
-          # With no CA/certs, just report TCP reachability
           if timeout 2 bash -lc "exec 3<>/dev/tcp/$GW/5001" 2>/dev/null; then
-            echo "tcp open (TLS not inspected)"
-            exec 3>&- 3<&- || true
+            echo "tcp open (TLS not inspected)"; exec 3>&- 3<&- || true
           else
-            echo "timeout"
+            echo "connection-refused"
           fi
-          echo ""
+          echo
         } >"$RESULTS"
 
         mkdir -p "$(Build.ArtifactStagingDirectory)"
@@ -83,26 +79,23 @@ stages:
         ArtifactName: 'LinuxVM_Probe'
         publishLocation: 'Container'
 
-  # ────────────────────────────────────────────────────────────────────────────
-  # 2) WINDOWS VM PROBE
-  # ────────────────────────────────────────────────────────────────────────────
+  # 2) Windows VM
   - job: Windows_VM_GatewayProbe
     displayName: Windows (VM) gateway probe
-    pool:
-      vmImage: 'windows-latest'
+    pool: { vmImage: 'windows-latest' }
     steps:
     - powershell: |
         $ErrorActionPreference = 'Stop'
 
         function Get-DefaultGateway {
           $gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-                 Sort-Object -Property RouteMetric, InterfaceMetric |
+                 Sort-Object RouteMetric, InterfaceMetric |
                  Select-Object -First 1).NextHop
           if (-not $gw) {
             $gw = (Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway } |
                    Select-Object -First 1).IPv4DefaultGateway.NextHop
           }
-          return $gw
+          $gw
         }
 
         function Test-Port {
@@ -110,36 +103,31 @@ stages:
           try {
             $c = New-Object System.Net.Sockets.TcpClient
             $iar = $c.BeginConnect($Host,$Port,$null,$null)
-            if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs)) {
-              $c.Close(); return "closed:$Port"
-            }
-            $c.EndConnect($iar); $c.Close(); return "open:$Port"
+            if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs)) { $c.Close(); return "closed:$Port" }
+            $c.EndConnect($iar); $c.Close(); "open:$Port"
           } catch { "closed:$Port" }
         }
 
         $gw = Get-DefaultGateway
         Write-Host "GW=$gw"
 
-        $lines = New-Object System.Collections.Generic.List[string]
+        $lines = [System.Collections.Generic.List[string]]::new()
         $lines.Add("## Windows (VM) gateway probe")
         $lines.Add("")
         $lines.Add("**Gateway:** $gw")
         $lines.Add("")
         $lines.Add("**Ports:**")
-        foreach($p in 5000,5001,2375,2376,80,443,8080){
-          $lines.Add("- " + (Test-Port -Host $gw -Port $p -TimeoutMs 1000))
-        }
+        foreach ($p in 5000,5001,2375,2376,80,443,8080) { $lines.Add("- " + (Test-Port $gw $p 1000)) }
 
         $lines.Add("")
-        $lines.Add("---- /v2/ (HTTP) ----")
+        $lines.Add("--- HTTP /v2/ ---")
         try {
           $resp = Invoke-WebRequest -UseBasicParsing -Uri ("http://{0}:5000/v2/" -f $gw) -TimeoutSec 2
           $lines.Add(("HTTP/{0} {1}" -f $resp.ProtocolVersion, [int]$resp.StatusCode))
-        } catch {
-          $lines.Add("timeout")
-        }
+        } catch { $lines.Add("connection-refused") }
 
-        $lines.Add("---- /v2/ (HTTPS) ----")
+        $lines.Add("")
+        $lines.Add("--- HTTPS /v2/ ---")
         try {
           add-type @"
 using System.Net;
@@ -149,19 +137,10 @@ public class TrustAll : System.Net.ICertificatePolicy {
 "@
           [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAll
           $req = [System.Net.HttpWebRequest]::Create(("https://{0}:5001/v2/" -f $gw))
-          $req.Method = "GET"
-          $req.Timeout = 2000
-          $req.AllowAutoRedirect = $false
-          try {
-            $res = $req.GetResponse()
-            $lines.Add(("HTTP/{0} {1}" -f $res.ProtocolVersion, [int]$res.StatusCode))
-            $res.Close()
-          } catch {
-            $lines.Add("timeout")
-          }
-        } catch {
-          $lines.Add("timeout")
-        }
+          $req.Method = "GET"; $req.Timeout = 2000; $req.AllowAutoRedirect = $false
+          try { $res = $req.GetResponse(); $lines.Add(("HTTP/{0} {1}" -f $res.ProtocolVersion, [int]$res.StatusCode)); $res.Close() }
+          catch { $lines.Add("connection-refused") }
+        } catch { $lines.Add("connection-refused") }
 
         $outDir = "$(Build.ArtifactStagingDirectory)".Replace("\","/")
         New-Item -ItemType Directory -Force -Path $outDir | Out-Null
@@ -176,22 +155,18 @@ public class TrustAll : System.Net.ICertificatePolicy {
         ArtifactName: 'WindowsVM_Probe'
         publishLocation: 'Container'
 
-  # ────────────────────────────────────────────────────────────────────────────
-  # 3) LINUX CONTAINER PROBE (non-root, no sudo/apt)
-  # ────────────────────────────────────────────────────────────────────────────
+  # 3) Linux CONTAINER (no root, no sudo)
   - job: Linux_Container_GatewayProbe_NoRoot
     displayName: Linux (container) gateway probe (no-root)
-    pool:
-      vmImage: 'ubuntu-latest'
-    container:
-      image: ubuntu:24.04
+    pool: { vmImage: 'ubuntu-latest' }
+    container: { image: 'ubuntu:24.04' }
     steps:
     - bash: |
         set -Eeuo pipefail
 
         GWH="$(awk '$1!="Iface" && $2=="00000000" {print $3; exit}' /proc/net/route || true)"
         hex2ip() { printf "%d.%d.%d.%d" 0x${1:6:2} 0x${1:4:2} 0x${1:2:2} 0x${1:0:2}; }
-        GW="$( [ -n "$GWH" ] && hex2ip "$GWH" || true )"
+        GW="$( [ -n "${GWH:-}" ] && hex2ip "$GWH" || true )"
         if [ -z "${GW:-}" ]; then
           GW="$(ip route 2>/dev/null | awk '/default/ {print $3; exit}')"
         fi
@@ -200,37 +175,47 @@ public class TrustAll : System.Net.ICertificatePolicy {
         check_port() {
           local p="$1"
           if timeout 1 bash -lc "exec 3<>/dev/tcp/$GW/$p" 2>/dev/null; then
-            echo "open:$p"
-            exec 3>&- 3<&- || true
+            echo "open:$p"; exec 3>&- 3<&- || true
           else
             echo "closed:$p"
+          fi
+        }
+
+        http_v2() {
+          local host="$1" port="$2"
+          if timeout 2 bash -lc "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then
+            printf 'GET /v2/ HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$host" >&3
+            head -n1 <&3 || true
+            exec 3>&- 3<&- || true
+          else
+            echo "connection-refused"
           fi
         }
 
         RESULTS="$(mktemp)"
         {
           echo "## Linux (container) gateway probe (pure bash)"
-          echo ""
+          echo
           echo "**Gateway:** $GW"
-          echo ""
+          echo
           echo "**Ports:**"
           for p in 5000 5001 2375 2376 80 443 8080; do
             echo "- $(check_port "$p")"
           done
-
-          echo ""
+          echo
           echo "--- HTTP /v2/ ---"
-          timeout 2 bash -lc "exec 3<>/dev/tcp/$GW/5000; printf 'GET /v2/ HTTP/1.1\r\nHost: $GW\r\nConnection: close\r\n\r\n' >&3; head -n1 <&3; exec 3>&- 3<&-" || echo "timeout"
-
-          echo ""
+          http_v2 "$GW" 5000
+          echo
           echo "--- HTTPS /v2/ ---"
           if timeout 2 bash -lc "exec 3<>/dev/tcp/$GW/5001" 2>/dev/null; then
-            echo "tcp open (TLS not inspected)"
-            exec 3>&- 3<&- || true
+            echo "tcp open (TLS not inspected)"; exec 3>&- 3<&- || true
           else
-            echo "timeout"
+            echo "connection-refused"
           fi
-          echo ""
+          echo
+          echo "--- identity ---"
+          id
+          echo
         } >"$RESULTS"
 
         mkdir -p "$(Build.ArtifactStagingDirectory)"
@@ -245,40 +230,40 @@ public class TrustAll : System.Net.ICertificatePolicy {
         ArtifactName: 'LinuxContainer_Probe'
         publishLocation: 'Container'
 
-  # ────────────────────────────────────────────────────────────────────────────
-  # 4) SANITY CHECK — Sidecar Docker Registry on the job’s network
-  # Proves our /v2/ GET logic works when a registry is actually present.
-  # ────────────────────────────────────────────────────────────────────────────
-  - job: Linux_Container_Sanity_ServiceRegistry
+  # 4) Sanity: run a real registry as a sidecar on the VM to validate our /v2/ logic
+  - job: Sanity_ServiceRegistry
     displayName: Sanity check (sidecar registry)
-    pool:
-      vmImage: 'ubuntu-latest'
-    container:
-      image: ubuntu:24.04
-    services:
-      reg:
-        image: registry:2
+    pool: { vmImage: 'ubuntu-latest' }
     steps:
     - bash: |
         set -Eeuo pipefail
-        REG_IP="$(getent hosts reg | awk '{print $1}')"
-        echo "reg service ip: $REG_IP"
+        docker run -d --rm --name reg -p 5000:5000 registry:2
+        # give it a moment
+        for i in {1..10}; do
+          if curl -fsS --max-time 1 -I http://127.0.0.1:5000/v2/ >/dev/null 2>&1; then break; fi
+          sleep 1
+        done
 
         RESULTS="$(mktemp)"
         {
           echo "## Sanity: sidecar docker registry"
-          echo ""
-          echo "**Service IP:** $REG_IP"
-          echo ""
+          echo
+          echo "**Service:** localhost:5000"
+          echo
           echo "--- HTTP /v2/ ---"
-          timeout 3 bash -lc "exec 3<>/dev/tcp/reg/5000; printf 'GET /v2/ HTTP/1.1\r\nHost: reg\r\nConnection: close\r\n\r\n' >&3; head -n1 <&3; exec 3>&- 3<&-" || echo "timeout"
-          echo ""
+          set +e
+          curl -fsS -I --max-time 2 http://127.0.0.1:5000/v2/ | head -n1 || echo "connection-refused"
+          set -e
+          echo
         } >"$RESULTS"
 
         mkdir -p "$(Build.ArtifactStagingDirectory)"
         cp "$RESULTS" "$(Build.ArtifactStagingDirectory)/summary.md"
         cat "$(Build.ArtifactStagingDirectory)/summary.md"
       displayName: Probe (service registry)
+    - bash: docker stop reg
+      displayName: Stop registry
+      condition: always()
     - task: PublishBuildArtifacts@1
       displayName: Publish sanity summary
       inputs:
@@ -286,18 +271,15 @@ public class TrustAll : System.Net.ICertificatePolicy {
         ArtifactName: 'Sanity_ServiceRegistry'
         publishLocation: 'Container'
 
-  # ────────────────────────────────────────────────────────────────────────────
-  # 5) FINAL SUMMARY — aggregate artifacts and compute a PASS/FAIL banner
-  # ────────────────────────────────────────────────────────────────────────────
+  # 5) Final summary
   - job: Summary
     displayName: Final PASS/FAIL summary
     dependsOn:
       - Linux_VM_GatewayProbe
       - Windows_VM_GatewayProbe
       - Linux_Container_GatewayProbe_NoRoot
-      - Linux_Container_Sanity_ServiceRegistry
-    pool:
-      vmImage: 'ubuntu-latest'
+      - Sanity_ServiceRegistry
+    pool: { vmImage: 'ubuntu-latest' }
     steps:
     - task: DownloadBuildArtifacts@1
       displayName: Download all probe artifacts
@@ -311,42 +293,35 @@ public class TrustAll : System.Net.ICertificatePolicy {
         OUT="$(Build.SourcesDirectory)/combined-summary.md"
 
         echo "# Gateway Probe Summary" > "$OUT"
-        echo "" >> "$OUT"
-        echo "_Run: $(Build.BuildNumber) | $(Date:yyyy-MM-dd HH:mm:ss)_" >> "$OUT"
-        echo "" >> "$OUT"
+        echo >> "$OUT"
+        echo "_Run: $(Build.BuildNumber) | $(Build.SourceBranchName)_" >> "$OUT"
+        echo >> "$OUT"
 
-        # Combine individual summaries
         for A in LinuxVM_Probe WindowsVM_Probe LinuxContainer_Probe Sanity_ServiceRegistry; do
           if [ -f "$ROOT/$A/summary.md" ]; then
             echo "## $A" >> "$OUT"
             cat "$ROOT/$A/summary.md" >> "$OUT"
-            echo "" >> "$OUT"
+            echo >> "$OUT"
           fi
         done
 
-        # Heuristic PASS/FAIL:
-        #   FAIL if any gateway probe shows 5000 open AND an HTTP status line for /v2/
-        #   Otherwise PASS (no registry detected on gateway).
+        # PASS if all gateway probes show port 5000 NOT open or /v2/ didn't return an HTTP status line.
+        # FAIL if any gateway probe shows 5000 open AND we saw an HTTP status line for /v2/.
         found_open5000=$(grep -R "open:5000" "$ROOT" || true)
-        found_http=$(grep -R "HTTP/1\." "$ROOT" | grep -Ei "/v2/|HTTP /v2/|---- /v2/|--- HTTP /v2/" || true)
+        found_http=$(grep -R "HTTP/1\." "$ROOT" | grep -Ei "/v2/" || true)
 
         STATUS="PASS"
-        NOTE="No container registry detected on the gateway (ports closed/timeouts)."
+        NOTE="No container registry detected on the gateway (ports closed or refused)."
         if [ -n "$found_open5000" ] && [ -n "$found_http" ]; then
           STATUS="FAIL"
-          NOTE="Possible registry endpoint detected on the gateway (port 5000 responded to /v2/)."
+          NOTE="Possible registry endpoint on the gateway (5000 responded to /v2/)."
         fi
 
         echo "**Result:** \`$STATUS\` — $NOTE" | tee -a "$OUT"
-        echo "" >> "$OUT"
-        echo "----" >> "$OUT"
-        echo "_Sanity check should show an HTTP status from the sidecar registry; if it doesn't, the probe logic is suspect._" >> "$OUT"
+        echo >> "$OUT"
+        echo "---" >> "$OUT"
+        echo "_Sanity job should show an HTTP status from the local registry; if not, probe logic is suspect._" >> "$OUT"
 
-        # Upload as Job Summary
         echo "##vso[task.uploadsummary]$OUT"
-
-        # Also print to logs
-        echo ""
-        echo "===== SUMMARY ====="
-        cat "$OUT"
+        echo; echo "===== SUMMARY ====="; cat "$OUT"
       displayName: Build and publish combined summary
