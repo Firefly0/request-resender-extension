@@ -1,7 +1,7 @@
 trigger: none
 pr: none
 
-name: "gateway-probe-$(Date:yyyyMMdd)$(Rev:.r)"
+name: 'gateway-probe-$(Date:yyyyMMdd)$(Rev:.r)'
 
 stages:
 - stage: Probe
@@ -16,7 +16,6 @@ stages:
     - bash: |
         set -Eeuo pipefail
 
-        # Compute gateway without extra tools
         GWH="$(awk '$1!="Iface" && $2=="00000000" {print $3; exit}' /proc/net/route || true)"
         hex2ip() { printf "%d.%d.%d.%d" 0x${1:6:2} 0x${1:4:2} 0x${1:2:2} 0x${1:0:2}; }
         GW="$( [ -n "${GWH:-}" ] && hex2ip "$GWH" || true )"
@@ -129,18 +128,13 @@ stages:
         $lines.Add("")
         $lines.Add("--- HTTPS /v2/ ---")
         try {
-          add-type @"
-using System.Net;
-public class TrustAll : System.Net.ICertificatePolicy {
-  public bool CheckValidationResult(ServicePoint srvPoint, System.Security.Cryptography.X509Certificates.X509Certificate certificate, WebRequest request, int certificateProblem) { return true; }
-}
-"@
-          [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAll
-          $req = [System.Net.HttpWebRequest]::Create(("https://{0}:5001/v2/" -f $gw))
-          $req.Method = "GET"; $req.Timeout = 2000; $req.AllowAutoRedirect = $false
-          try { $res = $req.GetResponse(); $lines.Add(("HTTP/{0} {1}" -f $res.ProtocolVersion, [int]$res.StatusCode)); $res.Close() }
-          catch { $lines.Add("connection-refused") }
-        } catch { $lines.Add("connection-refused") }
+          # Ignore TLS errors (self-signed, etc.) without embedding C#
+          [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+          $resp2 = Invoke-WebRequest -UseBasicParsing -Uri ("https://{0}:5001/v2/" -f $gw) -TimeoutSec 2 -ErrorAction Stop
+          $lines.Add(("HTTP/{0} {1}" -f $resp2.ProtocolVersion, [int]$resp2.StatusCode))
+        } catch { $lines.Add("connection-refused") } finally {
+          [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
+        }
 
         $outDir = "$(Build.ArtifactStagingDirectory)".Replace("\","/")
         New-Item -ItemType Directory -Force -Path $outDir | Out-Null
@@ -230,7 +224,7 @@ public class TrustAll : System.Net.ICertificatePolicy {
         ArtifactName: 'LinuxContainer_Probe'
         publishLocation: 'Container'
 
-  # 4) Sanity: run a real registry as a sidecar on the VM to validate our /v2/ logic
+  # 4) Sanity: run a real registry as a sidecar on the VM
   - job: Sanity_ServiceRegistry
     displayName: Sanity check (sidecar registry)
     pool: { vmImage: 'ubuntu-latest' }
@@ -238,7 +232,6 @@ public class TrustAll : System.Net.ICertificatePolicy {
     - bash: |
         set -Eeuo pipefail
         docker run -d --rm --name reg -p 5000:5000 registry:2
-        # give it a moment
         for i in {1..10}; do
           if curl -fsS --max-time 1 -I http://127.0.0.1:5000/v2/ >/dev/null 2>&1; then break; fi
           sleep 1
@@ -305,8 +298,6 @@ public class TrustAll : System.Net.ICertificatePolicy {
           fi
         done
 
-        # PASS if all gateway probes show port 5000 NOT open or /v2/ didn't return an HTTP status line.
-        # FAIL if any gateway probe shows 5000 open AND we saw an HTTP status line for /v2/.
         found_open5000=$(grep -R "open:5000" "$ROOT" || true)
         found_http=$(grep -R "HTTP/1\." "$ROOT" | grep -Ei "/v2/" || true)
 
