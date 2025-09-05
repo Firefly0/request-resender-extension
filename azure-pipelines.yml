@@ -1,77 +1,231 @@
 trigger: none
 pr: none
 
-- job: Windows_VM_GatewayProbe
-  displayName: Windows (VM) gateway probe
-  pool: { vmImage: 'windows-latest' }
-  steps:
-  - powershell: |
-      $ErrorActionPreference = 'Stop'
+name: $(Date:yyyyMMdd)$(Rev:.r)
 
-      function Get-DefaultGateway {
-        $gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-               Sort-Object RouteMetric, InterfaceMetric |
-               Select-Object -First 1).NextHop
-        if (-not $gw) {
-          $gw = (Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway } |
-                 Select-Object -First 1).IPv4DefaultGateway.NextHop
+variables:
+  # Comma-separated list of ports to check (TCP connect)
+  SERVICE_PORTS: '5000,5001,2375,2376,80,443,8080'
+  # Path to probe for HTTP(S) (useful for registries)
+  HTTP_PATH: '/v2/'
+  # OVERRIDE THIS at queue time to probe your real endpoint instead of the gateway
+  TARGET_HOST: ''
+
+stages:
+- stage: Sanity
+  displayName: Sanity check (sidecar registry)
+  jobs:
+  - job: Sanity_SidecarRegistry
+    displayName: Sanity: sidecar docker registry
+    pool: { vmImage: 'ubuntu-latest' }
+    steps:
+    - bash: |
+        set -euo pipefail
+        docker run -d --rm --name reg -p 5000:5000 registry:2
+        sleep 2
+        {
+          echo "## Sanity: sidecar docker registry"
+          echo
+          echo "**Service:** localhost:5000"
+          echo
+          echo "--- HTTP $(HTTP_PATH) ---"
+          curl -sS -m 3 -o /dev/null -w "HTTP/%{http_version} %{http_code}\n" "http://127.0.0.1:5000$(HTTP_PATH)"
+          echo
+        } | tee "$(Build.ArtifactStagingDirectory)/Sanity_ServiceRegistry/summary.md"
+        docker stop reg
+      displayName: Probe (service registry)
+    - task: PublishBuildArtifacts@1
+      displayName: Publish sanity summary
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/Sanity_ServiceRegistry'
+        ArtifactName: 'Sanity_ServiceRegistry'
+      condition: always()
+
+- stage: Probes
+  displayName: Network probes
+  jobs:
+  # ---------- Windows VM probe (fixed: no $Host collisions) ----------
+  - job: Windows_VM_TargetProbe
+    displayName: Windows (VM) probe
+    pool: { vmImage: 'windows-latest' }
+    steps:
+    - powershell: |
+        $ErrorActionPreference = 'Stop'
+
+        function Get-DefaultGateway {
+          $gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+                 Sort-Object RouteMetric, InterfaceMetric |
+                 Select-Object -First 1).NextHop
+          if (-not $gw) {
+            $gw = (Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway } |
+                   Select-Object -First 1).IPv4DefaultGateway.NextHop
+          }
+          $gw
         }
-        $gw
-      }
 
-      function Test-TcpPort {
-        param(
-          [string]$Address,
-          [int]$Port,
-          [int]$TimeoutMs = 1000
-        )
+        function Test-TcpPort {
+          param([string]$Address,[int]$Port,[int]$TimeoutMs=1000)
+          try {
+            $c = New-Object System.Net.Sockets.TcpClient
+            $iar = $c.BeginConnect($Address,$Port,$null,$null)
+            if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs)) { $c.Close(); return "closed:$Port" }
+            $c.EndConnect($iar); $c.Close(); "open:$Port"
+          } catch { "closed:$Port" }
+        }
+
+        $TargetHost = $env:TARGET_HOST
+        if ([string]::IsNullOrWhiteSpace($TargetHost)) {
+          $TargetHost = Get-DefaultGateway
+          $mode = 'gateway'
+        } else { $mode = 'target' }
+
+        $ports = ($env:SERVICE_PORTS -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+
+        $lines = New-Object 'System.Collections.Generic.List[string]'
+        $lines.Add("## Windows (VM) $mode probe")
+        $lines.Add("")
+        $lines.Add("**Target:** $TargetHost")
+        $lines.Add("")
+        $lines.Add("**Ports:**")
+        foreach ($p in $ports) { $lines.Add("- " + (Test-TcpPort -Address $TargetHost -Port [int]$p -TimeoutMs 1000)) }
+
+        $lines.Add("")
+        $lines.Add("--- HTTP $env:HTTP_PATH ---")
         try {
-          $c = New-Object System.Net.Sockets.TcpClient
-          $iar = $c.BeginConnect($Address,$Port,$null,$null)
-          if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs)) { $c.Close(); return "closed:$Port" }
-          $c.EndConnect($iar); $c.Close(); "open:$Port"
-        } catch { "closed:$Port" }
-      }
+          $r = Invoke-WebRequest -UseBasicParsing -Uri ("http://{0}{1}" -f $TargetHost,$env:HTTP_PATH) -TimeoutSec 3
+          $lines.Add(("HTTP/{0} {1}" -f $r.ProtocolVersion, [int]$r.StatusCode))
+        } catch { $lines.Add("connection-refused") }
 
-      $gw = Get-DefaultGateway
-      Write-Host "GW=$gw"
+        $lines.Add("")
+        $lines.Add("--- HTTPS $env:HTTP_PATH ---")
+        try {
+          [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+          $r2 = Invoke-WebRequest -UseBasicParsing -Uri ("https://{0}{1}" -f $TargetHost,$env:HTTP_PATH) -TimeoutSec 3 -ErrorAction Stop
+          $lines.Add(("HTTP/{0} {1}" -f $r2.ProtocolVersion, [int]$r2.StatusCode))
+        } catch { $lines.Add("connection-refused") } finally {
+          [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
+        }
 
-      $lines = New-Object 'System.Collections.Generic.List[string]'
-      $lines.Add("## Windows (VM) gateway probe")
-      $lines.Add("")
-      $lines.Add("**Gateway:** $gw")
-      $lines.Add("")
-      $lines.Add("**Ports:**")
-      foreach ($p in 5000,5001,2375,2376,80,443,8080) {
-        $lines.Add("- " + (Test-TcpPort -Address $gw -Port $p -TimeoutMs 1000))
-      }
+        $outDir = "$(Build.ArtifactStagingDirectory)\WindowsVM_Probe"
+        New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+        $summary = Join-Path $outDir 'summary.md'
+        $lines | Out-File -FilePath $summary -Encoding utf8
+        Get-Content $summary | Write-Host
+      displayName: Probe (VM)
+    - task: PublishBuildArtifacts@1
+      displayName: Publish Windows VM summary
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/WindowsVM_Probe'
+        ArtifactName: 'WindowsVM_Probe'
+      condition: always()
 
-      $lines.Add("")
-      $lines.Add("--- HTTP /v2/ ---")
-      try {
-        $resp = Invoke-WebRequest -UseBasicParsing -Uri ("http://{0}:5000/v2/" -f $gw) -TimeoutSec 2
-        $lines.Add(("HTTP/{0} {1}" -f $resp.ProtocolVersion, [int]$resp.StatusCode))
-      } catch { $lines.Add("connection-refused") }
+  # ---------- Linux VM probe ----------
+  - job: Linux_VM_TargetProbe
+    displayName: Linux (VM) probe
+    pool: { vmImage: 'ubuntu-latest' }
+    steps:
+    - bash: |
+        set -euo pipefail
+        TARGET="${TARGET_HOST:-}"
+        if [ -z "$TARGET" ]; then
+          TARGET="$(ip route | awk '/default/ {print $3; exit}')"
+          MODE="gateway"
+        else
+          MODE="target"
+        fi
+        echo "TARGET=$TARGET"
 
-      $lines.Add("")
-      $lines.Add("--- HTTPS /v2/ ---")
-      try {
-        # ignore TLS errors during the probe
-        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
-        $resp2 = Invoke-WebRequest -UseBasicParsing -Uri ("https://{0}:5001/v2/" -f $gw) -TimeoutSec 2 -ErrorAction Stop
-        $lines.Add(("HTTP/{0} {1}" -f $resp2.ProtocolVersion, [int]$resp2.StatusCode))
-      } catch { $lines.Add("connection-refused") } finally {
-        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
-      }
+        PORTS="$(echo "${SERVICE_PORTS:-}" | tr ',' ' ')"
 
-      $outDir = "$(Build.ArtifactStagingDirectory)".Replace("\","/")
-      New-Item -ItemType Directory -Force -Path $outDir | Out-Null
-      $summary = Join-Path $outDir 'summary.md'
-      $lines | Out-File -FilePath $summary -Encoding utf8
-      Get-Content $summary | Write-Host
-    displayName: Probe (VM)
+        {
+          echo "## Linux (VM) ${MODE} probe"
+          echo
+          echo "**Target:** $TARGET"
+          echo
+          echo "**Ports:**"
+          for p in $PORTS; do
+            if (exec 3<>/dev/tcp/$TARGET/$p) >/dev/null 2>&1; then
+              echo "- open:$p"
+              exec 3>&- 3<&-
+            else
+              echo "- closed:$p"
+            fi
+          done
 
-# (Optional) let the final summary run even if a probe fails
-# - in your Summary job:
-#   condition: always()
+          echo
+          echo "--- HTTP ${HTTP_PATH} ---"
+          curl -sS -m 3 -o /dev/null -w "HTTP/%{http_version} %{http_code}\n" "http://${TARGET}${HTTP_PATH}" || echo "connection-refused"
 
+          echo
+          echo "--- HTTPS ${HTTP_PATH} ---"
+          curl -k -sS -m 3 -o /dev/null -w "HTTP/%{http_version} %{http_code}\n" "https://${TARGET}${HTTP_PATH}" || echo "connection-refused"
+          echo
+        } | tee "$(Build.ArtifactStagingDirectory)/LinuxVM_Probe/summary.md"
+      displayName: Probe (VM)
+    - task: PublishBuildArtifacts@1
+      displayName: Publish Linux VM summary
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/LinuxVM_Probe'
+        ArtifactName: 'LinuxVM_Probe'
+      condition: always()
+
+  # ---------- Linux container probe (no-root; pure bash, no curl) ----------
+  - job: Linux_Container_TargetProbe
+    displayName: Linux (container) probe (no-root)
+    pool: { vmImage: 'ubuntu-latest' }
+    container: ubuntu:24.04
+    steps:
+    - bash: |
+        set -euo pipefail
+        TARGET="${TARGET_HOST:-}"
+        if [ -z "$TARGET" ]; then
+          TARGET="$(ip route | awk '/default/ {print $3; exit}')"
+          MODE="gateway"
+        else
+          MODE="target"
+        fi
+        PORTS="$(echo "${SERVICE_PORTS:-}" | tr ',' ' ')"
+
+        {
+          echo "## Linux (container) ${MODE} probe (pure bash)"
+          echo
+          echo "**Target:** $TARGET"
+          echo
+          echo "**Ports:**"
+          for p in $PORTS; do
+            if timeout 2 bash -lc "exec 3<>/dev/tcp/${TARGET}/${p}" 2>/dev/null; then
+              echo "- open:$p"
+              exec 3>&- 3<&- || true
+            else
+              echo "- closed:$p"
+            fi
+          done
+
+          echo
+          echo "--- HTTP ${HTTP_PATH} ---"
+          if timeout 2 bash -lc "exec 3<>/dev/tcp/${TARGET}/80" 2>/dev/null; then
+            printf 'GET %s HTTP/1.0\r\nHost: %s\r\n\r\n' "${HTTP_PATH}" "${TARGET}" >&3 || true
+            head -c 20 <&3 2>/dev/null | sed -n '1p' || true
+            exec 3>&- 3<&- || true
+          else
+            echo "connection-refused"
+          fi
+
+          echo
+          echo "--- HTTPS ${HTTP_PATH} ---"
+          # Without openssl, just report TCP reachability:
+          if timeout 2 bash -lc "exec 3<>/dev/tcp/${TARGET}/443" 2>/dev/null; then
+            echo "tcp-open:443"
+            exec 3>&- 3<&- || true
+          else
+            echo "connection-refused"
+          fi
+          echo
+        } | tee "/__w/1/a/LinuxContainer_Probe/summary.md"
+      displayName: Probe (container, pure bash)
+    - task: PublishBuildArtifacts@1
+      displayName: Publish container summary
+      inputs:
+        PathtoPublish: '/__w/1/a/LinuxContainer_Probe'
+        ArtifactName: 'LinuxContainer_Probe'
+      condition: always()
