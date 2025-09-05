@@ -8,15 +8,17 @@ jobs:
     vmImage: 'ubuntu-latest'
   container:
     image: ubuntu:24.04
-    # (Alternative to sudo) options: '--user 0:0'
+    options: '--user 0:0'   # run as root; ubuntu image has no sudo
   steps:
   - bash: |
-      set -euo pipefail
-      sudo apt-get update -y
-      sudo apt-get install -y curl iproute2 netcat-traditional
-      PORTS="5000 5001 2375 2376 80 443 8080"
+      set -euxo pipefail
+      apt-get update -y
+      apt-get install -y curl iproute2 netcat-traditional
       GW=$(ip route | awk '/default/ {print $3; exit}'); echo "GW=$GW"
-      for p in $PORTS; do nc -z -w1 "$GW" "$p" && echo "open:$p" || echo "closed:$p"; done
-      echo '--- HTTP /v2/ ---';  curl -i -m 2 "http://$GW:5000/v2/" || true
-      echo '--- HTTPS /v2/ ---'; curl -i -k -m 2 "https://$GW:5001/v2/" || true
-    displayName: Probe gateway (container)
+      for p in 5000 5001 2375 2376 80 443 8080; do
+        nc -z -w1 "$GW" "$p" && echo "open:$p" || echo "closed:$p"
+      done
+      echo '--- HTTP /v2/ ---';  curl -i -m 2 "http://$GW:5000/v2/" || echo timeout
+      echo '--- HTTPS /v2/ ---'; curl -k -i -m 2 "https://$GW:5001/v2/" || echo timeout
+    displayName: Probe gateway (container, root)
+    continueOnError: true
