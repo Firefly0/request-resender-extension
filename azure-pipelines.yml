@@ -1,24 +1,53 @@
 trigger: none
 
 jobs:
-# Container job: probe the container network gateway for a registry/Docker API
-- job: Linux_Container_GatewayProbe
-  displayName: Linux (container) gateway probe
+# Linux (container) gateway probe — no apt, no sudo, non-root compatible
+- job: Linux_Container_GatewayProbe_NoRoot
+  displayName: Linux (container) gateway probe (no-root)
   pool:
     vmImage: 'ubuntu-latest'
   container:
     image: ubuntu:24.04
-    options: '--user 0:0'   # run as root; ubuntu image has no sudo
+    # (options like --user are not required; steps run as UID 1001 anyway)
   steps:
   - bash: |
-      set -euxo pipefail
-      apt-get update -y
-      apt-get install -y curl iproute2 netcat-traditional
-      GW=$(ip route | awk '/default/ {print $3; exit}'); echo "GW=$GW"
+      set -Eeuo pipefail
+
+      # Derive default gateway from /proc/net/route (no iproute2 needed)
+      GWH=$(awk '$1!="Iface" && $2=="00000000" {print $3; exit}' /proc/net/route)
+      hex2ip() { printf "%d.%d.%d.%d" 0x${1:6:2} 0x${1:4:2} 0x${1:2:2} 0x${1:0:2}; }
+      GW=$(hex2ip "$GWH"); echo "GW=$GW"
+
+      # Helper: TCP port check using bash's /dev/tcp plus timeout
+      check_port() {
+        local p=$1
+        if timeout 1 bash -lc "exec 3<>/dev/tcp/$GW/$p" 2>/dev/null; then
+          echo "open:$p"
+          exec 3>&- 3<&- || true
+        else
+          echo "closed:$p"
+        fi
+      }
+
       for p in 5000 5001 2375 2376 80 443 8080; do
-        nc -z -w1 "$GW" "$p" && echo "open:$p" || echo "closed:$p"
+        check_port "$p"
       done
-      echo '--- HTTP /v2/ ---';  curl -i -m 2 "http://$GW:5000/v2/" || echo timeout
-      echo '--- HTTPS /v2/ ---'; curl -k -i -m 2 "https://$GW:5001/v2/" || echo timeout
-    displayName: Probe gateway (container, root)
+
+      echo '--- HTTP /v2/ ---'
+      # Minimal GET without curl; prints status line or times out
+      timeout 2 bash -lc "exec 3<>/dev/tcp/$GW/5000; printf 'GET /v2/ HTTP/1.1\r\nHost: $GW\r\nConnection: close\r\n\r\n' >&3; head -n1 <&3; exec 3>&- 3<&-" \
+        || echo timeout
+
+      echo '--- HTTPS /v2/ ---'
+      # We can’t do TLS handshakes without openssl; just report if 5001 is open
+      if timeout 2 bash -lc "exec 3<>/dev/tcp/$GW/5001" 2>/dev/null; then
+        echo "tcp open (TLS not inspected)"
+        exec 3>&- 3<&- || true
+      else
+        echo "timeout"
+      fi
+
+      echo "--- identity ---"
+      id -a
+    displayName: Probe gateway (container, pure bash)
     continueOnError: true
