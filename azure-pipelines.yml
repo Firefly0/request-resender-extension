@@ -19,22 +19,22 @@ jobs:
       curl -i -k -m 2 "https://$GW:5001/v2/" || true
     displayName: Probe job gateway for registry
 
-# Linux container job (separate bridge)
-- job: Linux_Container_GatewayProbe
-  displayName: Linux (container) gateway probe
-  pool:
-    vmImage: 'ubuntu-latest'
-  container: alpine:3.20
-  steps:
-  - bash: |
-      set -eu
-      apk add --no-cache curl iproute2 netcat-openbsd >/dev/null
-      GW=$(ip route | awk '/default/ {print $3; exit}'); echo "GW=$GW"
-      for p in 5000 5001 2375 2376 80 443 8080; do
-        nc -zvw1 "$GW" "$p" && echo "open:$p" || echo "closed:$p"
-      done
-      echo '--- HTTP /v2/ ---'
-      curl -i -m 2 "http://$GW:5000/v2/" || true
-      echo '--- HTTPS /v2/ ---'
-      curl -i -k -m 2 "https://$GW:5001/v2/" || true
-    displayName: Probe (container job)
+# # Linux container job (separate bridge)
+# - job: Linux_Container_GatewayProbe
+#   displayName: Linux (container) gateway probe
+#   pool:
+#     vmImage: 'ubuntu-latest'
+#   container: alpine:3.20
+#   steps:
+#   - bash: |
+#       set -eu
+#       apk add --no-cache curl iproute2 netcat-openbsd >/dev/null
+#       GW=$(ip route | awk '/default/ {print $3; exit}'); echo "GW=$GW"
+#       for p in 5000 5001 2375 2376 80 443 8080; do
+#         nc -zvw1 "$GW" "$p" && echo "open:$p" || echo "closed:$p"
+#       done
+#       echo '--- HTTP /v2/ ---'
+#       curl -i -m 2 "http://$GW:5000/v2/" || true
+#       echo '--- HTTPS /v2/ ---'
+#       curl -i -k -m 2 "https://$GW:5001/v2/" || true
+#     displayName: Probe (container job)
