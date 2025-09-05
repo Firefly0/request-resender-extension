@@ -1,7 +1,7 @@
 trigger: none
 pr: none
 
-name: $(Date:yyyyMMdd)$(Rev:.r)
+name: '$(Date:yyyyMMdd)$(Rev:.r)'
 
 variables:
   # Comma-separated list of ports to check (TCP connect)
@@ -16,22 +16,29 @@ stages:
   displayName: Sanity check (sidecar registry)
   jobs:
   - job: Sanity_SidecarRegistry
-    displayName: Sanity: sidecar docker registry
-    pool: { vmImage: 'ubuntu-latest' }
+    displayName: 'Sanity: sidecar docker registry'
+    pool:
+      vmImage: ubuntu-latest
     steps:
     - bash: |
         set -euo pipefail
         docker run -d --rm --name reg -p 5000:5000 registry:2
+        # tiny wait for the container to accept connections
         sleep 2
+
+        outdir="$(Build.ArtifactStagingDirectory)/Sanity_ServiceRegistry"
+        mkdir -p "$outdir"
+
         {
           echo "## Sanity: sidecar docker registry"
           echo
           echo "**Service:** localhost:5000"
           echo
-          echo "--- HTTP $(HTTP_PATH) ---"
-          curl -sS -m 3 -o /dev/null -w "HTTP/%{http_version} %{http_code}\n" "http://127.0.0.1:5000$(HTTP_PATH)"
+          echo "--- HTTP ${HTTP_PATH} ---"
+          curl -sS -m 3 -o /dev/null -w "HTTP/%{http_version} %{http_code}\n" "http://127.0.0.1:5000${HTTP_PATH}"
           echo
-        } | tee "$(Build.ArtifactStagingDirectory)/Sanity_ServiceRegistry/summary.md"
+        } | tee "$outdir/summary.md"
+
         docker stop reg
       displayName: Probe (service registry)
     - task: PublishBuildArtifacts@1
@@ -47,7 +54,8 @@ stages:
   # ---------- Windows VM probe (fixed: no $Host collisions) ----------
   - job: Windows_VM_TargetProbe
     displayName: Windows (VM) probe
-    pool: { vmImage: 'windows-latest' }
+    pool:
+      vmImage: windows-latest
     steps:
     - powershell: |
         $ErrorActionPreference = 'Stop'
@@ -122,7 +130,8 @@ stages:
   # ---------- Linux VM probe ----------
   - job: Linux_VM_TargetProbe
     displayName: Linux (VM) probe
-    pool: { vmImage: 'ubuntu-latest' }
+    pool:
+      vmImage: ubuntu-latest
     steps:
     - bash: |
         set -euo pipefail
@@ -136,6 +145,9 @@ stages:
         echo "TARGET=$TARGET"
 
         PORTS="$(echo "${SERVICE_PORTS:-}" | tr ',' ' ')"
+
+        outdir="$(Build.ArtifactStagingDirectory)/LinuxVM_Probe"
+        mkdir -p "$outdir"
 
         {
           echo "## Linux (VM) ${MODE} probe"
@@ -160,7 +172,7 @@ stages:
           echo "--- HTTPS ${HTTP_PATH} ---"
           curl -k -sS -m 3 -o /dev/null -w "HTTP/%{http_version} %{http_code}\n" "https://${TARGET}${HTTP_PATH}" || echo "connection-refused"
           echo
-        } | tee "$(Build.ArtifactStagingDirectory)/LinuxVM_Probe/summary.md"
+        } | tee "$outdir/summary.md"
       displayName: Probe (VM)
     - task: PublishBuildArtifacts@1
       displayName: Publish Linux VM summary
@@ -172,8 +184,9 @@ stages:
   # ---------- Linux container probe (no-root; pure bash, no curl) ----------
   - job: Linux_Container_TargetProbe
     displayName: Linux (container) probe (no-root)
-    pool: { vmImage: 'ubuntu-latest' }
-    container: ubuntu:24.04
+    pool:
+      vmImage: ubuntu-latest
+    container: 'ubuntu:24.04'
     steps:
     - bash: |
         set -euo pipefail
@@ -185,6 +198,9 @@ stages:
           MODE="target"
         fi
         PORTS="$(echo "${SERVICE_PORTS:-}" | tr ',' ' ')"
+
+        outdir="/__w/1/a/LinuxContainer_Probe"
+        mkdir -p "$outdir"
 
         {
           echo "## Linux (container) ${MODE} probe (pure bash)"
@@ -213,7 +229,7 @@ stages:
 
           echo
           echo "--- HTTPS ${HTTP_PATH} ---"
-          # Without openssl, just report TCP reachability:
+          # Without openssl inside the stock ubuntu container, just report TCP reachability:
           if timeout 2 bash -lc "exec 3<>/dev/tcp/${TARGET}/443" 2>/dev/null; then
             echo "tcp-open:443"
             exec 3>&- 3<&- || true
@@ -221,7 +237,7 @@ stages:
             echo "connection-refused"
           fi
           echo
-        } | tee "/__w/1/a/LinuxContainer_Probe/summary.md"
+        } | tee "$outdir/summary.md"
       displayName: Probe (container, pure bash)
     - task: PublishBuildArtifacts@1
       displayName: Publish container summary
