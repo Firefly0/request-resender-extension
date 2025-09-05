@@ -1,7 +1,7 @@
 trigger: none
 
 jobs:
-# Linux VM job (Microsoft-hosted)
+# 1) Linux VM (works for you already)
 - job: Linux_VM_GatewayProbe
   displayName: Linux (VM) gateway probe
   pool:
@@ -9,32 +9,45 @@ jobs:
   steps:
   - bash: |
       set -eu
+      PORTS="5000 5001 2375 2376 80 443 8080"
       GW=$(ip route | awk '/default/ {print $3; exit}'); echo "GW=$GW"
-      for p in 5000 5001 2375 2376 80 443 8080; do
-        nc -z -w1 "$GW" "$p" && echo "open:$p" || echo "closed:$p"
-      done
-      echo '--- HTTP /v2/ ---'
-      curl -i -m 2 "http://$GW:5000/v2/" || true
-      echo '--- HTTPS /v2/ ---'
-      curl -i -k -m 2 "https://$GW:5001/v2/" || true
-    displayName: Probe job gateway for registry
+      for p in $PORTS; do nc -z -w1 "$GW" "$p" && echo "open:$p" || echo "closed:$p"; done
+      echo '--- HTTP /v2/ ---';  curl -i -m 2 "http://$GW:5000/v2/" || true
+      echo '--- HTTPS /v2/ ---'; curl -i -k -m 2 "https://$GW:5001/v2/" || true
+      echo '--- IMDS headers ---'
+      curl -s -m 1 -D- -o /dev/null -H "Metadata: true" \
+        "http://169.254.169.254/metadata/instance?api-version=2021-02-01" || true
+    displayName: Probe job gateway (VM)
 
-# Linux container job (separate bridge)
+# 2) Linux CONTAINER job (use an image that has bash)
 - job: Linux_Container_GatewayProbe
   displayName: Linux (container) gateway probe
   pool:
     vmImage: 'ubuntu-latest'
-  container: alpine:3.20
+  container: ubuntu:24.04   # has /bin/bash
   steps:
   - bash: |
       set -eu
-      apk add --no-cache curl iproute2 netcat-openbsd >/dev/null
+      apt-get update -y >/dev/null
+      apt-get install -y curl iproute2 netcat-traditional >/dev/null
+      PORTS="5000 5001 2375 2376 80 443 8080"
       GW=$(ip route | awk '/default/ {print $3; exit}'); echo "GW=$GW"
-      for p in 5000 5001 2375 2376 80 443 8080; do
-        nc -zvw1 "$GW" "$p" && echo "open:$p" || echo "closed:$p"
-      done
-      echo '--- HTTP /v2/ ---'
-      curl -i -m 2 "http://$GW:5000/v2/" || true
-      echo '--- HTTPS /v2/ ---'
-      curl -i -k -m 2 "https://$GW:5001/v2/" || true
-    displayName: Probe (container job)
+      for p in $PORTS; do nc -z -w1 "$GW" "$p" && echo "open:$p" || echo "closed:$p"; done
+      echo '--- HTTP /v2/ ---';  curl -i -m 2 "http://$GW:5000/v2/" || true
+      echo '--- HTTPS /v2/ ---'; curl -i -k -m 2 "https://$GW:5001/v2/" || true
+    displayName: Probe job gateway (container)
+
+# 3) Optional: Windows VM sweep
+- job: Windows_VM_GatewayProbe
+  displayName: Windows (VM) gateway probe
+  pool:
+    vmImage: 'windows-latest'
+  steps:
+  - pwsh: |
+      $ports = 5000,5001,2375,2376,80,443,8080
+      $gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1).NextHop
+      "GW=$gw"
+      foreach($p in $ports){ if(Test-NetConnection -ComputerName $gw -Port $p -WarningAction SilentlyContinue -InformationLevel Quiet){ "open:$p"} else {"closed:$p"}}
+      "---- /v2/ (HTTP) ----";  curl.exe -i --max-time 2 "http://$gw:5000/v2/" 2>$null || echo "timeout"
+      "---- /v2/ (HTTPS) ----"; curl.exe -k -i --max-time 2 "https://$gw:5001/v2/" 2>$null || echo "timeout"
+    displayName: Probe job gateway (Windows)
