@@ -1,14 +1,7 @@
 trigger: none
 pr: none
 
-name: 'gateway-probe-$(Date:yyyyMMdd)$(Rev:.r)'
-
-stages:
-- stage: Probe
-  displayName: Gateway Probes
-  jobs:
-
-  - job: Windows_VM_GatewayProbe
+- job: Windows_VM_GatewayProbe
   displayName: Windows (VM) gateway probe
   pool: { vmImage: 'windows-latest' }
   steps:
