@@ -1,282 +1,111 @@
 # azure-pipelines.yml
-# Full probe suite:
-#  1) Sanity: spin up local registry:2 and probe /v2/
-#  2) Windows VM TCP port probe
-#  3) Linux VM TCP port probe
-#  4) Linux container TCP port probe (pure bash), fixed to avoid "unbound variable"
-
 trigger:
   - main
-
 pr:
   - main
 
-# ---- Defaults you can tweak at queue-time or in the UI ----
-variables:
-  # Comma/semicolon/space separated list of ports to probe
-  servicePorts: '80,443,5000,8080'
-  # TCP connect timeout (seconds)
-  tcpTimeoutSeconds: '2'
-  # Optional hard-coded target host (leave blank to auto-detect default gateway)
-  targetHost: ''
-
 stages:
-  - stage: Probes
-    displayName: "Connectivity & Sanity Probes"
-    jobs:
+- stage: Probes
+  displayName: "Azure Hosted Agent Recon (Safe)"
+  jobs:
 
-      # ─────────────────────────────────────────────────────────────
-      # 1) Sanity: sidecar docker registry on Linux VM
-      # ─────────────────────────────────────────────────────────────
-      - job: Sanity_ServiceRegistry
-        displayName: "Probe (service registry)"
-        pool:
-          vmImage: 'ubuntu-24.04'
-        steps:
-          - checkout: self
+  # Linux VM job (primary recon)
+  - job: linux_vm
+    pool:
+      vmImage: 'ubuntu-22.04'
+    steps:
+      - bash: |
+          set -euo pipefail
+          echo "### Tools"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nmap netcat-traditional curl jq
+          echo "Tools ready."
+        displayName: "Install tools"
 
-          - task: Bash@3
-            displayName: "Start registry:2 and probe GET /v2/"
-            inputs:
-              targetType: 'inline'
-              failOnStderr: false
-              script: |
-                set -Eeuo pipefail
-                echo "## Sanity: sidecar docker registry"
-                REG_NAME="sanity_registry_${RANDOM}"
-                ART_DIR="$(Build.ArtifactStagingDirectory)/Sanity_ServiceRegistry"
-                mkdir -p "$ART_DIR"
-                OUT="$ART_DIR/summary.txt"
+      - bash: |
+          set -euo pipefail
+          SUBNET=$(ip -o -f inet addr show eth0 | awk '/scope global/ {print $4}')
+          GW=$(ip route | awk '/default/ {print $3; exit}')
+          echo "Discovered subnet: $SUBNET"
+          echo "Default gateway: $GW"
+          echo "SUBNET=$SUBNET" >> $GITHUB_ENV
+          echo "GW=$GW" >> $GITHUB_ENV
+        displayName: "Discover subnet & gateway"
 
-                # Start local registry
-                docker run -d --rm --name "$REG_NAME" -p 5000:5000 registry:2
-                # Give it a moment to come up
-                for i in {1..20}; do
-                  if curl -fsS http://localhost:5000/v2/ >/dev/null 2>&1; then break; fi
-                  sleep 0.25
-                done
+      - bash: |
+          set -euo pipefail
+          PORTS=22,80,443,3306,5432,6379,2375,5000,8080,9200,15672
+          echo "Scanning $SUBNET on {$PORTS}..."
+          nmap -T4 -Pn --open -p "$PORTS" "$SUBNET" -oG scan.txt
+          echo "### Nmap results"
+          cat scan.txt
+        env:
+          SUBNET: $(SUBNET)
+        displayName: "Network scan (expanded but safe)"
 
-                {
-                  echo "**Service:** localhost:5000"
-                  echo
-                  echo "--- HTTP /v2/ ---"
-                  curl -iS http://localhost:5000/v2/ || true
-                } | tee "$OUT"
+      - bash: |
+          set -euo pipefail
+          REG="http://${GW}:5000"
+          echo "--- Probing for unauthenticated Docker Registry at $REG ---"
+          # Only probe real gateway. DO NOT start your own registry sidecar.
+          curl -sS -i --max-time 5 "$REG/v2/" || true
+          # If /v2/ looks alive, try a tiny catalog sample w/ short timeout.
+          curl -sS -i --max-time 5 "$REG/v2/_catalog?n=5" || true
+        env:
+          GW: $(GW)
+        displayName: "Gateway /v2/ check (no sidecar, no creds)"
 
-                # Stop the container so we leave the agent clean
-                docker stop "$REG_NAME" >/dev/null 2>&1 || true
+      - bash: |
+          set -euo pipefail
+          echo "--- Azure IMDS instance probe ---"
+          curl -s -m 3 -H "Metadata:true" \
+            "http://169.254.169.254/metadata/instance?api-version=2021-02-01" \
+            | head -n 20 || echo "No Azure IMDS (good)."
+        displayName: "Azure IMDS probe (read-only)"
 
-          - task: PublishBuildArtifacts@1
-            displayName: "Publish sanity summary"
-            condition: always()
-            inputs:
-              PathtoPublish: '$(Build.ArtifactStagingDirectory)/Sanity_ServiceRegistry'
-              ArtifactName: 'Sanity_ServiceRegistry'
-              publishLocation: 'Container'
+      - bash: |
+          set -euo pipefail
+          if grep -q '6379/open' scan.txt; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq redis-tools
+            for H in $(grep '6379/open' scan.txt | awk '{print $2}'); do
+              echo "Pinging Redis on $H:6379 (no data access)"
+              (redis-cli -h "$H" ping || true)
+            done
+          else
+            echo "No Redis hosts found in this run."
+          fi
+        displayName: "Conditional Redis PING (no data access)"
 
-      # ─────────────────────────────────────────────────────────────
-      # 2) Windows VM TCP port probe
-      # ─────────────────────────────────────────────────────────────
-      - job: Windows_VM_Probe
-        displayName: "Probe (VM)"
-        pool:
-          vmImage: 'windows-2022'
-        steps:
-          - checkout: self
+      - task: PublishBuildArtifacts@1
+        displayName: "Publish recon artifacts"
+        condition: always()
+        inputs:
+          PathtoPublish: '$(System.DefaultWorkingDirectory)'
+          ArtifactName: 'azure-recon'
+          publishLocation: 'Container'
 
-          - task: PowerShell@2
-            displayName: "TCP port probe (Windows VM)"
-            inputs:
-              targetType: 'inline'
-              script: |
-                Set-StrictMode -Version Latest
-                $ErrorActionPreference = 'Stop'
-
-                $artDir = Join-Path $env:BUILD_ARTIFACTSTAGINGDIRECTORY 'WindowsVM_Probe'
-                New-Item -ItemType Directory -Force -Path $artDir | Out-Null
-                $out = Join-Path $artDir 'summary.txt'
-
-                $targetHostVar = '$(targetHost)'.Trim()
-                if ([string]::IsNullOrWhiteSpace($targetHostVar)) {
-                  # auto-detect default gateway
-                  $gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' |
-                        Sort-Object RouteMetric, InterfaceMetric |
-                        Select-Object -First 1).NextHop
-                  if ([string]::IsNullOrWhiteSpace($gw)) { $gw = '127.0.0.1' }
-                  $target = $gw
-                  $mode = 'gateway'
-                } else {
-                  $target = $targetHostVar
-                  $mode = 'target'
-                }
-
-                $portsRaw = '$(servicePorts)'
-                if ([string]::IsNullOrWhiteSpace($portsRaw)) { $portsRaw = '80 443 5000 8080' }
-                $ports = ($portsRaw -split '[,; ]+' | Where-Object { $_ -match '^\d+$' } | Select-Object -Unique)
-
-                $timeoutSec = [int]('$(tcpTimeoutSeconds)')
-                if ($timeoutSec -le 0) { $timeoutSec = 2 }
-                $timeoutMs = $timeoutSec * 1000
-
-                Set-Content -Path $out -Value "## Windows VM gateway probe`n"
-                Add-Content -Path $out -Value ("**Target:** {0} ({1})`n" -f $target, $mode)
-                Add-Content -Path $out -Value "**Ports:**"
-
-                foreach ($p in $ports) {
-                  try {
-                    $client = New-Object System.Net.Sockets.TcpClient
-                    $iar = $client.BeginConnect($target, [int]$p, $null, $null)
-                    if ($iar.AsyncWaitHandle.WaitOne($timeoutMs)) {
-                      $client.EndConnect($iar)
-                      if ($client.Connected) {
-                        Add-Content -Path $out -Value ("- open:{0}" -f $p)
-                      } else {
-                        Add-Content -Path $out -Value ("- closed:{0}" -f $p)
-                      }
-                    } else {
-                      Add-Content -Path $out -Value ("- closed:{0}" -f $p)
-                    }
-                  } catch {
-                    Add-Content -Path $out -Value ("- closed:{0}" -f $p)
-                  } finally {
-                    if ($client) { $client.Dispose() }
-                  }
-                }
-
-          - task: PublishBuildArtifacts@1
-            displayName: "Publish Windows VM summary"
-            condition: always()
-            inputs:
-              PathtoPublish: '$(Build.ArtifactStagingDirectory)/WindowsVM_Probe'
-              ArtifactName: 'WindowsVM_Probe'
-              publishLocation: 'Container'
-
-      # ─────────────────────────────────────────────────────────────
-      # 3) Linux VM TCP port probe
-      # ─────────────────────────────────────────────────────────────
-      - job: Linux_VM_Probe
-        displayName: "Probe (Linux VM)"
-        pool:
-          vmImage: 'ubuntu-24.04'
-        steps:
-          - checkout: self
-
-          - task: Bash@3
-            displayName: "TCP port probe (Linux VM)"
-            inputs:
-              targetType: 'inline'
-              failOnStderr: false
-              script: |
-                set -Eeuo pipefail
-                ART_DIR="$(Build.ArtifactStagingDirectory)/LinuxVM_Probe"
-                mkdir -p "$ART_DIR"
-                OUT="$ART_DIR/summary.txt"
-                echo "## Linux VM gateway probe" > "$OUT"
-
-                TARGET_HOST="$(targetHost)"
-                if [ -z "$TARGET_HOST" ]; then
-                  hex=$(awk '$2=="00000000"{print $3; exit}' /proc/net/route || true)
-                  if [ -n "${hex:-}" ]; then
-                    a=$((16#${hex:6:2})); b=$((16#${hex:4:2})); c=$((16#${hex:2:2})); d=$((16#${hex:0:2}))
-                    TARGET_HOST="${a}.${b}.${c}.${d}"
-                    MODE="gateway"
-                  else
-                    TARGET_HOST="127.0.0.1"; MODE="fallback"
-                  fi
-                else
-                  MODE="target"
-                fi
-
-                {
-                  echo
-                  echo "**Target:** ${TARGET_HOST} (${MODE})"
-                  echo
-                  echo "**Ports:**"
-                } >> "$OUT"
-
-                PORTS="$(echo "$(servicePorts)" | tr ',;' ' ' | xargs -n1 | sort -u | xargs)"
-                [ -n "$PORTS" ] || PORTS="80 443 5000 8080"
-                TCP_TIMEOUT="$(tcpTimeoutSeconds)"; [ -n "$TCP_TIMEOUT" ] || TCP_TIMEOUT="2"
-
-                for p in $PORTS; do
-                  if timeout "$TCP_TIMEOUT" bash -lc "exec 3<>/dev/tcp/${TARGET_HOST}/${p}" 2>/dev/null; then
-                    echo "- open:$p" >> "$OUT"
-                  else
-                    echo "- closed:$p" >> "$OUT"
-                  fi
-                  exec 3>&- 3<&- || true
-                done
-
-          - task: PublishBuildArtifacts@1
-            displayName: "Publish Linux VM summary"
-            condition: always()
-            inputs:
-              PathtoPublish: '$(Build.ArtifactStagingDirectory)/LinuxVM_Probe'
-              ArtifactName: 'LinuxVM_Probe'
-              publishLocation: 'Container'
-
-      # ─────────────────────────────────────────────────────────────
-      # 4) Linux container job (pure bash) — fixed variable handling
-      # ─────────────────────────────────────────────────────────────
-      - job: Linux_Container_Probe
-        displayName: "Probe (container, pure bash)"
-        pool:
-          vmImage: 'ubuntu-24.04'
-        container: ubuntu:24.04
-        steps:
-          - checkout: self
-
-          - task: Bash@3
-            displayName: "TCP port probe (container)"
-            inputs:
-              targetType: 'inline'
-              failOnStderr: false
-              script: |
-                set -Eeuo pipefail
-                ART_DIR="$(Build.ArtifactStagingDirectory)/LinuxContainer_Probe"
-                mkdir -p "$ART_DIR"
-                OUT="$ART_DIR/summary.txt"
-                echo "## Linux (container) gateway probe" > "$OUT"
-
-                # NOTE: Use pipeline substitution (safe with set -u), not ${targetHost}
-                TARGET_HOST="$(targetHost)"
-                if [ -z "$TARGET_HOST" ]; then
-                  hex=$(awk '$2=="00000000"{print $3; exit}' /proc/net/route || true)
-                  if [ -n "${hex:-}" ]; then
-                    a=$((16#${hex:6:2})); b=$((16#${hex:4:2})); c=$((16#${hex:2:2})); d=$((16#${hex:0:2}))
-                    TARGET_HOST="${a}.${b}.${c}.${d}"
-                    MODE="gateway"
-                  else
-                    TARGET_HOST="127.0.0.1"; MODE="fallback"
-                  fi
-                else
-                  MODE="target"
-                fi
-
-                {
-                  echo
-                  echo "**Target:** ${TARGET_HOST} (${MODE})"
-                  echo
-                  echo "**Ports:**"
-                } >> "$OUT"
-
-                PORTS="$(echo "$(servicePorts)" | tr ',;' ' ' | xargs -n1 | sort -u | xargs)"
-                [ -n "$PORTS" ] || PORTS="80 443 5000 8080"
-                TCP_TIMEOUT="$(tcpTimeoutSeconds)"; [ -n "$TCP_TIMEOUT" ] || TCP_TIMEOUT="2"
-
-                for p in $PORTS; do
-                  if timeout "$TCP_TIMEOUT" bash -lc "exec 3<>/dev/tcp/${TARGET_HOST}/${p}" 2>/dev/null; then
-                    echo "- open:$p" >> "$OUT"
-                  else
-                    echo "- closed:$p" >> "$OUT"
-                  fi
-                  exec 3>&- 3<&- || true
-                done
-
-          - task: PublishBuildArtifacts@1
-            displayName: "Publish container summary"
-            condition: always()
-            inputs:
-              PathtoPublish: '$(Build.ArtifactStagingDirectory)/LinuxContainer_Probe'
-              ArtifactName: 'LinuxContainer_Probe'
-              publishLocation: 'Container'
+  # Optional: Windows VM quick port probe of gateway
+  - job: windows_vm
+    pool:
+      vmImage: 'windows-2022'
+    steps:
+      - powershell: |
+          Set-StrictMode -Version Latest
+          $gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' |
+                 Sort-Object RouteMetric, InterfaceMetric |
+                 Select-Object -First 1).NextHop
+          if ([string]::IsNullOrWhiteSpace($gw)) { $gw = '127.0.0.1' }
+          $ports = @(80,443,5000,8080)
+          Write-Host "Gateway: $gw"
+          foreach ($p in $ports) {
+            try {
+              $c = New-Object System.Net.Sockets.TcpClient
+              $iar = $c.BeginConnect($gw, [int]$p, $null, $null)
+              if ($iar.AsyncWaitHandle.WaitOne(2000)) {
+                $c.EndConnect($iar)
+                if ($c.Connected) { Write-Host "open:$p" } else { Write-Host "closed:$p" }
+              } else { Write-Host "closed:$p" }
+              $c.Dispose()
+            } catch { Write-Host "closed:$p" }
+          }
+        displayName: "Windows VM gateway probe (80/443/5000/8080)"
