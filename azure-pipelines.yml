@@ -81,37 +81,42 @@ stages:
           PORTS="22,80,443,3306,5432,5601,5672,15672,2375,2376,2379,2380,5000,8080,8081,8500,8443,9200,9300,10250,10255,3000,50070"
 
           echo "Scanning $HOST_IP and $GW on {$PORTS}..." | tee artifacts/scan.txt
-          # Gentle scan: no -Pn, no reverse-DNS, short host timeout & low retries
           nmap -T4 -n --open --max-retries 1 --host-timeout 10s -p "$PORTS" \
-            $HOST_IP ${GW:+$GW} -oG artifacts/scan.gnmap || true
+            "$HOST_IP" ${GW:+$GW} -oG artifacts/scan.gnmap || true
 
           echo "---- Open hosts summary ----" | tee -a artifacts/scan.txt
           awk '/Ports: /{print $2" "$0}' artifacts/scan.gnmap | tee -a artifacts/scan.txt
 
     - task: Bash@3
-      displayName: HTTP HEAD/OPTIONS probe (only discovered HTTP-ish endpoints)
+      displayName: HTTP HEAD/OPTIONS probe (host+GW if HTTP-ish)
       inputs:
         targetType: inline
         script: |
           set -euo pipefail
           mkdir -p artifacts
+          out="artifacts/http-headers-cors.txt"
+          : > "$out"
 
-          # Pick first host with an HTTP-ish port from the scan results
-          H=$(grep -E ' (80|443|8080|8081|8443)/open' artifacts/scan.gnmap | awk '{print $2}' | head -n1 || true)
-          if [ -n "${H:-}" ]; then
-            {
-              echo "Target: $H"
-              echo "--- HEAD http://$H/ (5s)"
-              curl -sS -I --max-time 5 "http://$H/" | head -n 40 || true
-              echo
-              echo "--- OPTIONS http://$H/ (CORS check)"
-              curl -sS -X OPTIONS -I --max-time 5 "http://$H/" | grep -Ei 'access-control-allow|allow:|server:' || true
-              echo
-              echo "--- HEAD https://$H/ (if TLS terminates)"
-              curl -sS -I -k --max-time 5 "https://$H/" | head -n 40 || true
-            } > artifacts/http-headers-cors.txt
+          # Collect any hosts (host or gateway) that showed HTTP-ish ports in the scan
+          mapfile -t http_hosts < <(grep -E ' (80|443|8080|8081|8443)/open' artifacts/scan.gnmap | awk '{print $2}' | sort -u || true)
+
+          if [ "${#http_hosts[@]}" -eq 0 ]; then
+            echo "No HTTP-ish hosts found." | tee "$out"
           else
-            echo "No HTTP-ish hosts found." | tee artifacts/http-headers-cors.txt
+            for H in "${http_hosts[@]}"; do
+              {
+                echo "== Target: $H =="
+                echo "--- HEAD http://$H/ (5s)"
+                curl -sS -I --max-time 5 "http://$H/" | head -n 40 || true
+                echo
+                echo "--- OPTIONS http://$H/ (CORS check)"
+                curl -sS -X OPTIONS -I --max-time 5 "http://$H/" | grep -Ei 'access-control-allow|allow:|server:' || true
+                echo
+                echo "--- HEAD https://$H/ (if TLS terminates)"
+                curl -sS -I -k --max-time 5 "https://$H/" | head -n 40 || true
+                echo
+              } >> "$out"
+            done
           fi
 
     - task: Bash@3
@@ -126,16 +131,19 @@ stages:
             (curl -s -m 3 -H "Metadata:true" \
               "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | head -n 50) || echo "No IMDS."
             echo
-            echo "### Managed Identity token endpoint STATUS ONLY"
-            # Do NOT capture tokens; just record HTTP status and body length.
-            # Expect 400/404 when no identity is attached.
-            CODE=000
-            BODYLEN=0
+            echo "### Managed Identity token endpoint STATUS ONLY (with header)"
             RESP="$(curl -s -m 3 -i -H "Metadata:true" \
-              "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F")" || true
+              "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F" || true)"
             CODE="$(printf "%s" "$RESP" | awk 'NR==1{print $2}')"
             BODYLEN="$(printf "%s" "$RESP" | tail -n +2 | wc -c | awk "{print \$1}")"
             echo "HTTP status: ${CODE:-unknown}, body-bytes: ${BODYLEN:-0}"
+            echo
+            echo "### Token endpoint STATUS ONLY (without header; should fail)"
+            RESP2="$(curl -s -m 3 -i \
+              "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F" || true)"
+            CODE2="$(printf "%s" "$RESP2" | awk 'NR==1{print $2}')"
+            BODYLEN2="$(printf "%s" "$RESP2" | tail -n +2 | wc -c | awk "{print \$1}")"
+            echo "HTTP status (no header): ${CODE2:-unknown}, body-bytes: ${BODYLEN2:-0}"
           } > artifacts/imds-azure.txt
 
     - task: Bash@3
@@ -158,6 +166,29 @@ stages:
             echo "### ctr version (5s timeout)"
             timeout 5s ctr --version 2>&1 || echo "ctr not present or no access (expected)."
           } > artifacts/isolation-probes.txt
+
+    - task: Bash@3
+      displayName: Egress posture check (status-only, low-noise)
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+          mkdir -p artifacts
+          OUT="artifacts/egress-linux.txt"
+          : > "$OUT"
+
+          check() {
+            local url="$1"
+            local note="$2"
+            # print: URL | HTTP_CODE | BYTES | TOTAL_TIME
+            read -r CODE BYTES TIME < <(curl -sS -m 5 -o /dev/null -w "%{http_code} %{size_download} %{time_total}" "$url" || echo "000 0 0")
+            printf "%-40s | code=%-3s bytes=%-8s time=%ss\n" "$note" "$CODE" "$BYTES" "$TIME" >> "$OUT"
+          }
+
+          check "https://management.azure.com/"   "HTTPS mgmt endpoint"
+          check "https://example.com/"            "HTTPS example.com"
+          check "http://1.1.1.1"                  "HTTP to 1.1.1.1"
+          check "http://169.254.169.254/"         "HTTP IMDS root (no header)"
 
     - task: Bash@3
       displayName: Prepare artifacts
@@ -217,10 +248,65 @@ stages:
           $o += (Get-DnsClientServerAddress | Format-Table -AutoSize | Out-String)
           $o -join "`n" | Set-Content -Path artifacts\win-local.txt -Encoding UTF8
 
+    # NEW: Windows IMDS status-only probe (with/without header)
+    - task: PowerShell@2
+      displayName: Azure IMDS probe (Windows; status-only)
+      inputs:
+        targetType: inline
+        script: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $urlInstance = "http://169.254.169.254/metadata/instance?api-version=2021-02-01"
+          $urlToken    = "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F"
+
+          function CurlStatus([string]$Url, [bool]$WithHeader) {
+            $hdr = $WithHeader ? "-H `"Metadata:true`"" : ""
+            $resp = & curl.exe -s -m 3 -i @($hdr) $Url 2>$null
+            if (-not $resp) { return "HTTP status: 000, body-bytes: 0" }
+            $status = ($resp -split "`n")[0] -replace "HTTP/\S+\s+",""
+            $code = ($status -split "\s+")[0]
+            $body = ($resp -split "`n",2)[1]
+            $len  = [Text.Encoding]::UTF8.GetByteCount($body)
+            return "HTTP status: $code, body-bytes: $len"
+          }
+
+          $lines = @()
+          $lines += "### Instance metadata (first ~30 lines)"
+          try {
+            $inst = & curl.exe -s -m 3 -H "Metadata:true" $urlInstance
+            if ($inst) { $lines += ($inst -split "`n")[0..([Math]::Min(29,($inst -split "`n").Count-1))] }
+            else { $lines += "No IMDS (instance)"; }
+          } catch { $lines += "No IMDS (instance)"; }
+
+          $lines += ""
+          $lines += "### Token endpoint STATUS ONLY (with header)"
+          $lines += (CurlStatus $urlToken $true)
+          $lines += "### Token endpoint STATUS ONLY (without header; should fail)"
+          $lines += (CurlStatus $urlToken $false)
+
+          $lines -join "`r`n" | Set-Content -Path artifacts\win-imds.txt -Encoding UTF8
+
+    # NEW: Windows egress posture check (status-only)
+    - task: PowerShell@2
+      displayName: Egress posture check (Windows; status-only)
+      inputs:
+        targetType: inline
+        script: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $out = "artifacts\egress-windows.txt"
+          if (Test-Path $out) { Remove-Item $out -Force }
+          function Check([string]$Url, [string]$Note) {
+            $res = & curl.exe -s -m 5 -o NUL -w "code=%{http_code} bytes=%{size_download} time=%{time_total}" $Url 2>$null
+            if (-not $res) { $res = "code=000 bytes=0 time=0" }
+            "$('{0,-40}' -f $Note) | $res" | Add-Content -Path $out -Encoding UTF8
+          }
+          Check "https://management.azure.com/" "HTTPS mgmt endpoint"
+          Check "https://example.com/"          "HTTPS example.com"
+          Check "http://1.1.1.1"                "HTTP to 1.1.1.1"
+          Check "http://169.254.169.254/"       "HTTP IMDS root (no header)"
+
     - task: PublishBuildArtifacts@1
       displayName: Publish recon artifacts (Windows)
       inputs:
         PathtoPublish: 'artifacts'
         ArtifactName: 'azure-recon-windows'
         publishLocation: 'Container'
-
