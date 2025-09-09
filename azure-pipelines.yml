@@ -2,19 +2,25 @@
 trigger: none
 pr: none
 
-pool:
-  vmImage: 'ubuntu-22.04'
+# NOTE: This pipeline is intentionally scoped to the current VM and its default gateway
+# to stay within Microsoft ROE. Do not broaden without explicit permission.
 
 stages:
+# =========================
+# Linux Hosted Agent Recon
+# =========================
 - stage: ReconLinux
-  displayName: Linux VM probes (deep safe)
+  displayName: Linux VM probes (safe & scoped)
+  pool:
+    vmImage: 'ubuntu-22.04'
   jobs:
   - job: linux_recon
     displayName: Linux VM probes
     steps:
     - checkout: self
+
     - task: Bash@3
-      displayName: Install tools
+      displayName: Install tools (quiet)
       inputs:
         targetType: inline
         script: |
@@ -25,21 +31,23 @@ stages:
             nmap netcat-openbsd curl jq dnsutils redis-tools whois
 
     - task: Bash@3
-      displayName: Discover subnet & gateway
+      displayName: Discover host & gateway
       inputs:
         targetType: inline
         script: |
           set -euo pipefail
-          SUBNET=$(ip -o -f inet addr show eth0 | awk '/scope global/ {print $4}')
-          GW=$(ip route | awk '/default/ {print $3}' | head -n1)
           mkdir -p artifacts
+          HOST_IP="$(hostname -I | awk '{print $1}')"
+          SUBNET="$(ip -o -f inet addr show eth0 | awk '/scope global/ {print $4}')"
+          GW="$(ip route | awk '/default/ {print $3}' | head -n1)"
           {
-            echo "Discovered subnet: ${SUBNET:-unknown}"
+            echo "Host IP: ${HOST_IP:-unknown}"
+            echo "Subnet: ${SUBNET:-unknown}"
             echo "Default gateway: ${GW:-unknown}"
           } | tee artifacts/net-basics.txt
 
     - task: Bash@3
-      displayName: Neighbor/route/DNS view (local only)
+      displayName: Local routes / neigh / DNS (read-only)
       inputs:
         targetType: inline
         script: |
@@ -62,115 +70,94 @@ stages:
           } > artifacts/local-network-view.txt
 
     - task: Bash@3
-      displayName: Focused network scan (expanded targets)
+      displayName: Focused network scan (host + gateway only)
       inputs:
         targetType: inline
         script: |
           set -euo pipefail
-          SUBNET=$(ip -o -f inet addr show eth0 | awk '/scope global/ {print $4}')
           mkdir -p artifacts
-          # add higher-value internal ports
+          HOST_IP="$(hostname -I | awk '{print $1}')"
+          GW="$(ip route | awk '/default/ {print $3}' | head -n1)"
           PORTS="22,80,443,3306,5432,5601,5672,15672,2375,2376,2379,2380,5000,8080,8081,8500,8443,9200,9300,10250,10255,3000,50070"
-          echo "Scanning ${SUBNET} on {${PORTS}}..." | tee artifacts/scan.txt
-          nmap -T4 -Pn --open -p "$PORTS" "$SUBNET" -oG artifacts/scan.gnmap || true
-          # Summaries
+
+          echo "Scanning $HOST_IP and $GW on {$PORTS}..." | tee artifacts/scan.txt
+          # Gentle scan: no -Pn, no reverse-DNS, short host timeout & low retries
+          nmap -T4 -n --open --max-retries 1 --host-timeout 10s -p "$PORTS" \
+            $HOST_IP ${GW:+$GW} -oG artifacts/scan.gnmap || true
+
           echo "---- Open hosts summary ----" | tee -a artifacts/scan.txt
           awk '/Ports: /{print $2" "$0}' artifacts/scan.gnmap | tee -a artifacts/scan.txt
 
     - task: Bash@3
-      displayName: HTTP header & CORS/OPTIONS probe (first HTTP service only)
+      displayName: HTTP HEAD/OPTIONS probe (only discovered HTTP-ish endpoints)
       inputs:
         targetType: inline
         script: |
           set -euo pipefail
           mkdir -p artifacts
-          HOST=$(grep -E ' (80|443|8080|8081|8443)/open' artifacts/scan.gnmap | awk '{print $2}' | head -n1 || true)
-          if [ -n "${HOST:-}" ]; then
+
+          # Pick first host with an HTTP-ish port from the scan results
+          H=$(grep -E ' (80|443|8080|8081|8443)/open' artifacts/scan.gnmap | awk '{print $2}' | head -n1 || true)
+          if [ -n "${H:-}" ]; then
             {
-              echo "Target: $HOST"
-              echo "--- HEAD http://$HOST/ (5s)"
-              curl -sS -I --max-time 5 "http://$HOST/" | head -n 40 || true
+              echo "Target: $H"
+              echo "--- HEAD http://$H/ (5s)"
+              curl -sS -I --max-time 5 "http://$H/" | head -n 40 || true
               echo
-              echo "--- OPTIONS http://$HOST/ (CORS check)"
-              curl -sS -X OPTIONS -I --max-time 5 "http://$HOST/" | grep -Ei 'access-control-allow|allow:|server:' || true
+              echo "--- OPTIONS http://$H/ (CORS check)"
+              curl -sS -X OPTIONS -I --max-time 5 "http://$H/" | grep -Ei 'access-control-allow|allow:|server:' || true
               echo
-              echo "--- HEAD https://$HOST/ (if TLS terminates)"
-              curl -sS -I -k --max-time 5 "https://$HOST/" | head -n 40 || true
+              echo "--- HEAD https://$H/ (if TLS terminates)"
+              curl -sS -I -k --max-time 5 "https://$H/" | head -n 40 || true
             } > artifacts/http-headers-cors.txt
           else
             echo "No HTTP-ish hosts found." | tee artifacts/http-headers-cors.txt
           fi
 
     - task: Bash@3
-      displayName: Azure IMDS probe (read-only)
+      displayName: Azure IMDS probe (read-only + token endpoint status-only)
       inputs:
         targetType: inline
         script: |
           set -euo pipefail
-          (curl -s -m 3 -H "Metadata:true" \
-            "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | head -n 50 \
-            || echo "No Azure IMDS (good).") > artifacts/imds-azure.txt
-
-    - task: Bash@3
-      displayName: Conditional service pings (Redis, Elasticsearch, Kubelet…)
-      inputs:
-        targetType: inline
-        script: |
-          set -euo pipefail
-          SCAN="artifacts/scan.gnmap"
           mkdir -p artifacts
           {
-            echo "### Redis PING"
-            for H in $(awk '/6379\/open/{print $2}' "$SCAN"); do
-              echo "PING $H:6379"
-              (redis-cli -h "$H" ping || true) | sed 's/^/  /'
-            done
-            [ "$(awk '/6379\/open/{print $2}' "$SCAN" | wc -l)" -gt 0 ] || echo "No Redis found."
-
+            echo "### Instance metadata (first 50 lines)"
+            (curl -s -m 3 -H "Metadata:true" \
+              "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | head -n 50) || echo "No IMDS."
             echo
-            echo "### Elasticsearch version header (HEAD only)"
-            for H in $(awk '/9200\/open/{print $2}' "$SCAN"); do
-              echo "HEAD http://$H:9200/"
-              curl -sS -I --max-time 5 "http://$H:9200/" | grep -Ei 'x-elastic|server:|www-authenticate' || true
-            done
-            [ "$(awk '/9200\/open/{print $2}' "$SCAN" | wc -l)" -gt 0 ] || echo "No ES found."
-
-            echo
-            echo "### Kubelet read-only port check (10255) + secure (10250) headers"
-            for H in $(awk '/10255\/open|10250\/open/{print $2}' "$SCAN"); do
-              echo "HEAD http://$H:10255/ or https://$H:10250/"
-              curl -sS -I --max-time 5 "http://$H:10255/" | head -n 10 || true
-              curl -sS -k -I --max-time 5 "https://$H:10250/" | head -n 10 || true
-            done
-
-            echo
-            echo "### Jenkins/SonarQube/Vault headers (if present)"
-            for PORT in 8080 8081 8443 8200; do
-              for H in $(awk -v p="$PORT" '$0 ~ p"/open" {print $2}' "$SCAN"); do
-                echo "HEAD $H:$PORT"
-                curl -sS -I -k --max-time 5 "http://$H:$PORT/" | grep -Ei 'jenkins|sonarqube|vault|server:|www-authenticate' || true
-              done
-            done
-          } > artifacts/service-pings.txt
+            echo "### Managed Identity token endpoint STATUS ONLY"
+            # Do NOT capture tokens; just record HTTP status and body length.
+            # Expect 400/404 when no identity is attached.
+            CODE=000
+            BODYLEN=0
+            RESP="$(curl -s -m 3 -i -H "Metadata:true" \
+              "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F")" || true
+            CODE="$(printf "%s" "$RESP" | awk 'NR==1{print $2}')"
+            BODYLEN="$(printf "%s" "$RESP" | tail -n +2 | wc -c | awk "{print \$1}")"
+            echo "HTTP status: ${CODE:-unknown}, body-bytes: ${BODYLEN:-0}"
+          } > artifacts/imds-azure.txt
 
     - task: Bash@3
-      displayName: Reverse DNS sweep (PTR of local /24 slice)
+      displayName: Isolation probes (docker/containerd presence & perms)
       inputs:
         targetType: inline
         script: |
           set -euo pipefail
           mkdir -p artifacts
-          SUBNET=$(ip -o -f inet addr show eth0 | awk '/scope global/ {print $4}')
-          if [ -n "${SUBNET:-}" ]; then
-            NET=$(echo "$SUBNET" | cut -d/ -f1 | awk -F. '{print $1"."$2"."$3}')
-            echo "PTR sweep of ${NET}.0/24 (first 64 hosts)" | tee artifacts/ptr.txt
-            for i in $(seq 1 64); do
-              ip="${NET}.${i}"
-              host "$ip" | sed "s/^/${ip} -> /" || true
-            done >> artifacts/ptr.txt
-          else
-            echo "No subnet; skipping PTR sweep." | tee artifacts/ptr.txt
-          fi
+          {
+            echo "### docker socket"
+            ls -l /var/run/docker.sock 2>&1 || true
+            echo
+            echo "### docker info (5s timeout)"
+            timeout 5s docker info 2>&1 || echo "docker info not available or times out (expected on hosted)."
+            echo
+            echo "### containerd socket"
+            ls -l /run/containerd/containerd.sock 2>&1 || true
+            echo
+            echo "### ctr version (5s timeout)"
+            timeout 5s ctr --version 2>&1 || echo "ctr not present or no access (expected)."
+          } > artifacts/isolation-probes.txt
 
     - task: Bash@3
       displayName: Prepare artifacts
@@ -183,21 +170,25 @@ stages:
           echo "Done."
 
     - task: PublishBuildArtifacts@1
-      displayName: Publish recon artifacts
+      displayName: Publish recon artifacts (Linux)
       inputs:
         PathtoPublish: 'artifacts'
         ArtifactName: 'azure-recon-linux'
         publishLocation: 'Container'
 
-# Windows parity (gateway reachability + local intel)
+# =========================
+# Windows Hosted Agent Recon
+# =========================
 - stage: ReconWindows
-  displayName: Windows VM gateway probe
+  displayName: Windows VM gateway probe (safe & scoped)
   pool:
     vmImage: 'windows-2022'
   jobs:
   - job: win_probe
+    displayName: Windows VM gateway probe
     steps:
     - checkout: self
+
     - task: PowerShell@2
       displayName: Gateway probe (80/443/5000/8080)
       inputs:
@@ -209,7 +200,7 @@ stages:
           foreach ($p in 80,443,5000,8080) {
             $res = Test-NetConnection -ComputerName $gw -Port $p -WarningAction SilentlyContinue
             $state = if ($res.TcpTestSucceeded) { "open" } else { "closed" }
-            "$state:$p" | Tee-Object -FilePath artifacts\win-gateway.txt -Append
+            "$($state):$p" | Tee-Object -FilePath artifacts\win-gateway.txt -Append
           }
 
     - task: PowerShell@2
@@ -227,8 +218,9 @@ stages:
           $o -join "`n" | Set-Content -Path artifacts\win-local.txt -Encoding UTF8
 
     - task: PublishBuildArtifacts@1
-      displayName: Publish Windows probe artifacts
+      displayName: Publish recon artifacts (Windows)
       inputs:
         PathtoPublish: 'artifacts'
         ArtifactName: 'azure-recon-windows'
         publishLocation: 'Container'
+
