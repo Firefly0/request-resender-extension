@@ -41,18 +41,25 @@ stages:
           
           echo "--- ESCAPING CONTAINER to fingerprint ${TARGET_IP}:${TARGET_PORT} from the host ---"
           
+          # This is the corrected command. It creates a temp directory on the host,
+          # runs the chrooted nmap to write its output there, and then we copy it back.
           docker run --rm --privileged --network=host -v /:/hostfs \
             -v /usr/bin/nmap:/usr/bin/nmap -v /usr/share/nmap:/usr/share/nmap \
-            -v $(pwd)/artifacts:/artifacts \
             alpine:latest sh -c "
+              # Create a directory on the HOST we can write to from inside the chroot
+              mkdir -p /hostfs/tmp/scan_results
+
               echo '--- [HOST] Attempting to fingerprint the service with Nmap Version Detection (-sV) ---'
               
               # -sV: Probe open ports to determine service/version info
-              # -Pn: Skip host discovery (we know it's up)
-              # --version-intensity 5: A reasonable level for deeper probes without being too slow
-              chroot /hostfs /usr/bin/nmap -Pn -sV --version-intensity 5 -p ${TARGET_PORT} ${TARGET_IP} -oN /artifacts/service-fingerprint.txt
+              # Write the output to the host's /tmp/scan_results directory
+              chroot /hostfs /usr/bin/nmap -Pn -sV --version-intensity 5 -p ${TARGET_PORT} ${TARGET_IP} -oN /tmp/scan_results/service-fingerprint.txt
             "
           
+          # Now, copy the results from the host's temp directory back into our artifacts folder
+          sudo cp /tmp/scan_results/* artifacts/
+          sudo rm -rf /tmp/scan_results
+
           echo "✅ FINGERPRINTING COMPLETE."
           echo "--- Nmap Service/Version Scan Results ---"
           cat artifacts/service-fingerprint.txt
@@ -60,7 +67,7 @@ stages:
           if grep -q "State: open" artifacts/service-fingerprint.txt; then
             echo "✅ VULNERABILITY CONFIRMED: Successfully connected to the open port and gathered service information."
           else
-            echo "⚠️ Test inconclusive. Could not gather service information."
+            echo "⚠️ Test inconclusive. Could not gather service information from the open port."
           fi
     - task: PublishPipelineArtifact@1
       displayName: 'Publish Service Fingerprint Artifacts'
