@@ -1,71 +1,327 @@
-# azure-pipelines.yml (excerpt)
+# azure-pipelines.yml
+name: recon_$(Date:yyyyMMdd)$(Rev:.r)
+
 trigger: none
 pr: none
 
-pool:
-  vmImage: 'ubuntu-22.04'
+stages:
+- stage: Recon
+  displayName: Recon & Cross-tenant Proof
+  jobs:
 
-steps:
-  - bash: |
-      set -euo pipefail
-      echo "### Install tools"
-      sudo apt-get update -yq
-      sudo apt-get install -yq --no-install-recommends \
-        curl jq traceroute nmap iproute2 dnsutils netcat-openbsd
+  # -------------------------
+  # Linux job (ubuntu-22.04)
+  # -------------------------
+  - job: linux_recon
+    displayName: Linux (ubuntu-22.04) recon
+    pool:
+      vmImage: 'ubuntu-22.04'
+    steps:
+      - task: Bash@3
+        displayName: "Recon + cross-tenant proof (safe)"
+        inputs:
+          targetType: inline
+          script: |
+            set -Eeuo pipefail
 
-      echo "### Discover host & gateway"
-      ip -4 a | awk '/inet /{print $2}' | sed -n '1p' | tee artifacts/host-ip.txt
-      ip -4 route | tee artifacts/routes.txt
-      GW=$(ip route | awk '/default/ {print $3; exit}')
-      HOST=$(hostname -I | awk '{print $1}')
-      echo "Host IP: $HOST" | tee -a artifacts/local.txt
-      echo "Gateway: $GW" | tee -a artifacts/local.txt
+            # Always have an artifacts dir
+            mkdir -p artifacts
 
-      echo "### Focused TCP scan (host + gw)"
-      nmap -Pn -n -sT -p 22,80,443,445,3389,5000,8080,5432 "$HOST" "$GW" \
-        | tee artifacts/scan.txt
+            echo "### Install tools"
+            sudo apt-get update -yq
+            sudo apt-get install -yq --no-install-recommends \
+              curl jq traceroute nmap iproute2 dnsutils netcat-openbsd whois openssl
 
-      echo "### UDP quick probe (needs root)"
-      sudo nmap -Pn -n -sU --top-ports 10 "$GW" | tee artifacts/udp-scan.txt || true
+            echo "### Discover host & gateway"
+            HOST_IP="$(ip -o -4 addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1 || true)"
+            [[ -n "${HOST_IP:-}" ]] || HOST_IP="$(hostname -I | tr ' ' '\n' | grep -v '^127\.' | head -1 || true)"
+            GW_IP="$(ip route | awk '/^default/ {print $3; exit}')"
 
-      echo "### IMDS non-secret probe (Azure style)"
-      # instance metadata only; no token endpoints
-      AZ_META=$(curl -s -H Metadata:true "http://169.254.169.254/metadata/instance?api-version=2021-02-01")
-      echo "$AZ_META" | jq '.' > artifacts/imds-azure.json || true
-      echo "subscriptionId: $(echo "$AZ_META" | jq -r '.compute.subscriptionId // "n/a"')" > artifacts/imds-azure.txt
-      echo "resourceGroup:  $(echo "$AZ_META" | jq -r '.compute.resourceGroupName // "n/a"')" >> artifacts/imds-azure.txt
-      echo "location:       $(echo "$AZ_META" | jq -r '.compute.location // "n/a"')" >> artifacts/imds-azure.txt
+            {
+              echo "Host IP: ${HOST_IP:-<none>}"
+              echo "Gateway: ${GW_IP:-<none>}"
+              echo "Subnets:"
+              ip -o -4 addr show scope global | awk '{print "- " $2 ": " $4}'
+              echo
+              echo "Routes (IPv4):"
+              ip -4 route
+              echo
+              echo "Neighbors (ARP):"
+              ip neigh || true
+              echo
+              echo "DNS test (example.com):"
+              dig +short A example.com || true
+              dig +short AAAA example.com || true
+            } | tee artifacts/local-network-view.txt
 
-      echo "### Egress posture"
-      {
-        echo "http://example.com: $(curl -s -o /dev/null -w '%{http_code}' http://example.com)"
-        echo "https://example.com: $(curl -s -o /dev/null -w '%{http_code}' https://example.com)"
-        echo "https://ifconfig.me/ip -> $(curl -s https://ifconfig.me/ip || true)"
-        echo "udp/53 (DNS) -> $(dig +short A example.com @1.1.1.1 | head -1 | sed 's/$/ (ok)/' || echo fail)"
-        echo "udp/123 (NTP) -> $(timeout 2 nc -uzvw1 time.cloudflare.com 123 >/dev/null 2>&1 && echo ok || echo blocked)"
-        echo "smtp.gmail.com:25 -> $(timeout 3 bash -c 'echo QUIT | nc -w2 smtp.gmail.com 25 >/dev/null 2>&1 && echo open || echo blocked')"
-        echo "smtp.gmail.com:587 -> $(timeout 3 bash -c 'echo QUIT | nc -w2 smtp.gmail.com 587 >/dev/null 2>&1 && echo open || echo blocked')"
-      } | tee artifacts/egress-posture.txt
+            echo "### Azure IMDS (non-secret instance metadata)"
+            AZ_VER="2021-02-01"
+            AZ_META="$(curl -sS -H Metadata:true "http://169.254.169.254/metadata/instance?api-version=${AZ_VER}" || true)"
+            if [[ -n "$AZ_META" ]]; then
+              echo "$AZ_META" | jq '.' > artifacts/imds-azure.json
+              {
+                echo "subscriptionId:  $(jq -r '.compute.subscriptionId      // "n/a"' <<<"$AZ_META")"
+                echo "resourceGroup:   $(jq -r '.compute.resourceGroupName   // "n/a"' <<<"$AZ_META")"
+                echo "vmScaleSetName:  $(jq -r '.compute.vmScaleSetName      // "n/a"' <<<"$AZ_META")"
+                echo "vmId:            $(jq -r '.compute.vmId                // "n/a"' <<<"$AZ_META")"
+                echo "location:        $(jq -r '.compute.location           // "n/a"' <<<"$AZ_META")"
+                echo "sku/offer:       $(jq -r '[.compute.sku,.compute.offer]|join("/") // "n/a"' <<<"$AZ_META")"
+                echo "privateIPv4:     $(jq -r '.network.interface[0].ipv4.ipAddress[0].privateIpAddress // "n/a"' <<<"$AZ_META")"
+                echo "macAddress:      $(jq -r '.network.interface[0].macAddress // "n/a"' <<<"$AZ_META")"
+                echo "subnet:          $(jq -r '.network.interface[0].ipv4.subnet[0].address // "n/a"' <<<"$AZ_META")"
+              } | tee artifacts/imds-azure.txt
+            else
+              echo "IMDS unavailable" | tee artifacts/imds-azure.txt
+            fi
 
-      echo "### Traceroute (short, tcp/443) with sudo"
-      sudo traceroute -n -T -p 443 -m 6 1.1.1.1 | tee artifacts/traceroute.txt || true
+            echo "### Azure attested document (signed proof of host identity)"
+            curl -sS -H Metadata:true \
+              "http://169.254.169.254/metadata/attested/document?api-version=2020-09-01" \
+              -o artifacts/imds-attested-document.json || true
 
-      echo "### Build run summary (markdown)"
-      {
-        echo "### SUMMARY ($(date -u +%FT%TZ))"
-        echo
-        echo "#### Azure IMDS highlights"
-        sed 's/^/- /' artifacts/imds-azure.txt || true
-        echo
-        echo "#### Egress posture"
-        sed 's/^/- /' artifacts/egress-posture.txt
-        echo
-        echo "#### Public IP"
-        curl -s https://ifconfig.me/ip || true
-        echo
-        echo "#### Open ports (nmap summary)"
-        grep -E 'open|filtered|closed' artifacts/scan.txt | sed 's/^/- /'
-      } | tee artifacts/SUMMARY.md
-    displayName: "Recon + fixed privileges"
-  - publish: artifacts
-    artifact: azure-recon-linux
+            echo "### Public egress & WHOIS/RDAP"
+            PUB_IP="$(curl -sS https://ifconfig.me/ip || true)"
+            {
+              echo "public_ip: ${PUB_IP:-<none>}"
+              if [[ -n "${PUB_IP:-}" ]]; then
+                echo
+                echo "whois:"
+                whois "$PUB_IP" | egrep -i 'orgname|organization|netname|descr|route|origin|country|cidr' | sed 's/^/  /' || true
+              fi
+            } | tee artifacts/egress-posture.txt
+
+            echo "### MAC OUI (provider fingerprint)"
+            NIC_MAC="$(ip link show | awk '/link\/ether/ {print $2; exit}')"
+            OUI="$(echo "$NIC_MAC" | awk -F: '{print tolower($1 ":" $2 ":" $3)}')"
+            {
+              echo "nic_mac: $NIC_MAC"
+              echo "oui:     $OUI"
+              if [[ "$OUI" == "00:15:5d" ]]; then
+                echo "oui_note: 00:15:5d → Microsoft / Hyper-V (expected for Azure-hosted)"
+              fi
+            } | tee artifacts/mac-oui.txt
+
+            echo "### Cloud fabric endpoints"
+            {
+              echo "imds (169.254.169.254) reachable?"
+              (timeout 2 bash -c 'cat < /dev/null > /dev/tcp/169.254.169.254/80' && echo "tcp/80 open" || echo "no tcp/80")
+              echo
+              echo "wire server (168.63.129.16) probe:"
+              (timeout 2 bash -c 'cat < /dev/null > /dev/tcp/168.63.129.16/80' && echo "tcp/80 open" || echo "no tcp/80")
+              (timeout 2 bash -c 'cat < /dev/null > /dev/tcp/168.63.129.16/32526' && echo "tcp/32526 open" || echo "no tcp/32526")
+              echo
+              echo "routes to IMDS / wire:"
+              ip route get 169.254.169.254 || true
+              ip route get 168.63.129.16   || true
+            } | tee artifacts/service-pings.txt
+
+            echo "### Host+gateway scan (safe set)"
+            if [[ -n "${HOST_IP:-}" ]]; then
+              sudo nmap -Pn -n -sT -p 22,80,443,445,3306,3389,5432,8080,8443 "$HOST_IP" | tee artifacts/scan.txt || true
+            fi
+            if [[ -n "${GW_IP:-}" ]]; then
+              sudo nmap -Pn -n -sT -p 22,80,443,445,3306,3389,5432,8080,8443 "$GW_IP" | tee -a artifacts/scan.txt || true
+              # UDP requires elevated privileges; run a small top-ports probe
+              sudo nmap -Pn -n -sU --top-ports 10 "$GW_IP" | tee artifacts/udp-scan.txt || true
+            fi
+
+            echo "### Traceroute (short, tcp/443)"
+            sudo traceroute -n -T -p 443 -m 6 1.1.1.1 | tee artifacts/traceroute.txt || true
+
+            echo "### SUMMARY"
+            {
+              echo "### SUMMARY ($(date -u +%FT%TZ))"
+              echo
+              echo "#### Provider-owned identifiers (from Azure IMDS)"
+              sed 's/^/- /' artifacts/imds-azure.txt || true
+              echo
+              echo "#### Azure attested document"
+              echo "- saved to artifacts/imds-attested-document.json (signed by Azure)"
+              echo
+              echo "#### Public egress attribution"
+              sed 's/^/- /' artifacts/egress-posture.txt
+              echo
+              echo "#### NIC vendor fingerprint"
+              sed 's/^/- /' artifacts/mac-oui.txt
+              echo
+              echo "#### Fabric endpoints & routes"
+              sed 's/^/- /' artifacts/service-pings.txt | head -80
+              echo
+              echo "#### Local/Gateway service exposure (nmap)"
+              (grep -E 'open|filtered|closed' artifacts/scan.txt || true) | sed 's/^/- /'
+            } | tee artifacts/SUMMARY.md
+
+            echo "### Checksums"
+            (cd artifacts && sha256sum * > SHA256SUMS.txt) || true
+
+      - task: PublishPipelineArtifact@1
+        displayName: "Publish recon artifacts (Linux)"
+        inputs:
+          targetPath: artifacts
+          artifact: azure-recon-linux
+
+  # -------------------------
+  # Windows job (windows-2022)
+  # -------------------------
+  - job: windows_recon
+    displayName: Windows (windows-2022) recon
+    pool:
+      vmImage: 'windows-2022'
+    steps:
+      - task: PowerShell@2
+        displayName: "Recon + cross-tenant proof (safe)"
+        inputs:
+          targetType: inline
+          script: |
+            $ErrorActionPreference = 'Stop'
+            New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+
+            # Local network view
+            $ipcfg = Get-NetIPConfiguration
+            $gw    = ($ipcfg | Where-Object {$_.IPv4DefaultGateway} | Select-Object -First 1).IPv4DefaultGateway.NextHop
+            $host4 = ($ipcfg | ForEach-Object {$_.IPv4Address} | Where-Object {$_.IPAddress -and $_.PrefixLength -lt 32} | Select-Object -First 1).IPAddress
+            $dnsA  = (Resolve-DnsName example.com -Type A   -ErrorAction SilentlyContinue)
+            $dnsAAAA = (Resolve-DnsName example.com -Type AAAA -ErrorAction SilentlyContinue)
+
+            $localView = @()
+            $localView += "Host IPv4: {0}" -f ($host4 ?? '<none>')
+            $localView += "Gateway: {0}" -f ($gw   ?? '<none>')
+            $localView += ""
+            $localView += "Interfaces:"
+            foreach ($ad in Get-NetAdapter | Sort-Object -Property ifIndex) {
+              $ipv4 = (Get-NetIPAddress -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+              foreach ($addr in $ipv4) { $localView += ("- {0}: {1}/{2}" -f $ad.Name, $addr.IPAddress, $addr.PrefixLength) }
+            }
+            $localView += ""
+            $localView += "Routes (IPv4):"
+            $localView += (Get-NetRoute -AddressFamily IPv4 | Format-Table -AutoSize | Out-String)
+            $localView += ""
+            $localView += "ARP (IPv4):"
+            $localView += (arp -a | Out-String)
+            $localView += ""
+            $localView += "DNS test (example.com):"
+            if ($dnsA)    { $localView += ($dnsA    | Format-Table -AutoSize | Out-String) }
+            if ($dnsAAAA) { $localView += ($dnsAAAA | Format-Table -AutoSize | Out-String) }
+            $localView -join "`r`n" | Out-File -Encoding UTF8 artifacts\win-local.txt
+
+            # IMDS metadata (non-secret)
+            $imdsTxt = "IMDS unavailable"
+            try {
+              $imdsJson = Invoke-RestMethod -Headers @{ Metadata = 'true' } -TimeoutSec 2 -Uri "http://169.254.169.254/metadata/instance?api-version=2021-02-01"
+              $imdsJson | ConvertTo-Json -Depth 12 | Out-File -Encoding UTF8 artifacts\imds-azure.json
+              $imdsTxt = @"
+subscriptionId:  $($imdsJson.compute.subscriptionId)
+resourceGroup:   $($imdsJson.compute.resourceGroupName)
+vmScaleSetName:  $($imdsJson.compute.vmScaleSetName)
+vmId:            $($imdsJson.compute.vmId)
+location:        $($imdsJson.compute.location)
+sku/offer:       $($imdsJson.compute.sku)/$($imdsJson.compute.offer)
+privateIPv4:     $($imdsJson.network.interface[0].ipv4.ipAddress[0].privateIpAddress)
+macAddress:      $($imdsJson.network.interface[0].macAddress)
+subnet:          $($imdsJson.network.interface[0].ipv4.subnet[0].address)
+"@
+            } catch {}
+
+            $imdsTxt | Out-File -Encoding UTF8 artifacts\imds-azure.txt
+
+            # Attested document
+            try {
+              Invoke-WebRequest -Headers @{ Metadata = 'true' } -TimeoutSec 4 `
+                -Uri "http://169.254.169.254/metadata/attested/document?api-version=2020-09-01" `
+                -OutFile artifacts\imds-attested-document.json | Out-Null
+            } catch {}
+
+            # Public egress & RDAP (whois alternative)
+            $pubip = ""
+            try { $pubip = (Invoke-RestMethod https://ifconfig.me/ip -TimeoutSec 4) } catch {}
+            $egress = @("public_ip: {0}" -f ($pubip -replace '\s','' | ForEach-Object {$_} ?? '<none>'))
+            if ($pubip) {
+              try {
+                $rdap = Invoke-RestMethod ("https://rdap.arin.net/registry/ip/{0}" -f $pubip) -TimeoutSec 6
+                $org  = $rdap.entities | Where-Object {$_.vcardArray} | Select-Object -First 1
+                $name = if ($org) { ($org.vcardArray[1] | Where-Object {$_[0] -eq 'fn'})[0][3] } else { $null }
+                $cidr = ($rdap.network.cidr0_cidrs | ForEach-Object { "{0}/{1}" -f $_.v4prefix, $_.length }) -join ", "
+                $egress += ""
+                $egress += "rdap.org:  {0}" -f ($name ?? 'n/a')
+                $egress += "rdap.cidr: {0}" -f ($cidr ?? 'n/a')
+              } catch {}
+            }
+            $egress -join "`r`n" | Out-File -Encoding UTF8 artifacts\egress-posture.txt
+
+            # MAC OUI
+            $nic = Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | Select-Object -First 1
+            $mac = $nic.MacAddress
+            $oui = ($mac -replace '-',':').ToLower().Substring(0,8)
+            $macTxt = @("nic_mac: {0}" -f $mac, "oui:     {0}" -f $oui)
+            if ($oui -eq '00:15:5d') { $macTxt += "oui_note: 00:15:5d → Microsoft / Hyper-V (expected for Azure-hosted)" }
+            $macTxt -join "`r`n" | Out-File -Encoding UTF8 artifacts\mac-oui.txt
+
+            # Fabric endpoints & routes
+            $svc = @()
+            $svc += "IMDS (169.254.169.254) tcp/80:"
+            try { $r = Test-NetConnection -ComputerName 169.254.169.254 -Port 80 -WarningAction SilentlyContinue; $svc += ($r.TcpTestSucceeded ? 'open' : 'closed') } catch { $svc += 'n/a' }
+            $svc += ""
+            $svc += "Wire server (168.63.129.16) tcp/80:"
+            try { $r = Test-NetConnection -ComputerName 168.63.129.16 -Port 80 -WarningAction SilentlyContinue; $svc += ($r.TcpTestSucceeded ? 'open' : 'closed') } catch { $svc += 'n/a' }
+            $svc += "Wire server (168.63.129.16) tcp/32526:"
+            try { $r = Test-NetConnection -ComputerName 168.63.129.16 -Port 32526 -WarningAction SilentlyContinue; $svc += ($r.TcpTestSucceeded ? 'open' : 'closed') } catch { $svc += 'n/a' }
+            $svc += ""
+            $svc += "Routes to IMDS / wire:"
+            $svc += (Get-NetRoute -DestinationPrefix "169.254.169.254/32" -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-String)
+            $svc += (Get-NetRoute -DestinationPrefix "168.63.129.16/32"   -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-String)
+            $svc -join "`r`n" | Out-File -Encoding UTF8 artifacts\service-pings.txt
+
+            # Gateway probe (a few common ports)
+            if ($gw) {
+              $ports = @(80,443,445,3389,5000,8080,53,25,587)
+              $probe = @("Gateway: {0}" -f $gw)
+              foreach ($p in $ports) {
+                try {
+                  $r = Test-NetConnection -ComputerName $gw -Port $p -WarningAction SilentlyContinue
+                  $state = if ($r.TcpTestSucceeded) { 'open' } else { 'closed' }
+                  $probe += ("{0}:{1}" -f $state, $p)
+                } catch {
+                  $probe += ("n/a:{0}" -f $p)
+                }
+              }
+              $probe -join "`r`n" | Out-File -Encoding UTF8 artifacts\gateway-probe.txt
+            }
+
+            # Short tracert
+            try { tracert -h 4 1.1.1.1 | Out-File -Encoding UTF8 artifacts\traceroute.txt } catch {}
+
+            # SUMMARY
+            $summary = @()
+            $summary += "### SUMMARY ($(Get-Date).ToUniversalTime().ToString('s'))Z"
+            $summary += ""
+            $summary += "#### Provider-owned identifiers (from Azure IMDS)"
+            $summary += (Get-Content artifacts\imds-azure.txt)
+            $summary += ""
+            $summary += "#### Azure attested document"
+            $summary += "- saved to artifacts/imds-attested-document.json (signed by Azure)"
+            $summary += ""
+            $summary += "#### Public egress attribution"
+            $summary += (Get-Content artifacts\egress-posture.txt)
+            $summary += ""
+            $summary += "#### NIC vendor fingerprint"
+            $summary += (Get-Content artifacts\mac-oui.txt)
+            $summary += ""
+            $summary += "#### Fabric endpoints & routes"
+            $summary += (Get-Content artifacts\service-pings.txt)
+            if (Test-Path artifacts\gateway-probe.txt) {
+              $summary += ""
+              $summary += "#### Gateway probe"
+              $summary += (Get-Content artifacts\gateway-probe.txt)
+            }
+            $summary -join "`r`n" | Out-File -Encoding UTF8 artifacts\SUMMARY.md
+
+            # Checksums
+            Get-ChildItem artifacts | Get-FileHash -Algorithm SHA256 |
+              ForEach-Object { "{0}  {1}" -f $_.Hash, $_.Path.Split([IO.Path]::DirectorySeparatorChar)[-1] } |
+              Out-File -Encoding ASCII artifacts\SHA256SUMS.txt
+
+      - task: PublishPipelineArtifact@1
+        displayName: "Publish recon artifacts (Windows)"
+        inputs:
+          targetPath: artifacts
+          artifact: azure-recon-windows
