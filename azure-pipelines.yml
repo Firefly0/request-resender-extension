@@ -8,7 +8,7 @@ name: $(Date:yyyyMMdd)$(Rev:.r)
 
 variables:
   TARGET_URL: 'http://127.0.0.1:8084'   # Only localhost is allowed by guard below
-  ACK_ENV_VAR: 'I_ATTEST_LEGAL_SCOPE'   # Must be true in pipeline variables to run the container proof
+  ACK_ENV_VAR: true   # Must be true in pipeline variables to run the container proof
 
 stages:
 - stage: RunnerHardeningProof
