@@ -1,335 +1,71 @@
-# azure-pipelines.yml
-# Recon & egress posture from Microsoft-hosted runners (Linux + Windows)
-# Safe, low-noise, and artifact-driven. No secrets pulled; IMDS token endpoints checked status-only.
-
+# azure-pipelines.yml (excerpt)
 trigger: none
 pr: none
 
-stages:
-- stage: Recon
-  displayName: Runner Recon
-  jobs:
+pool:
+  vmImage: 'ubuntu-22.04'
 
-  # =========================
-  # Linux job (ubuntu-22.04)
-  # =========================
-  - job: linux_recon
-    displayName: Linux (ubuntu-22.04) recon
-    pool:
-      vmImage: 'ubuntu-22.04'
-    steps:
-    - checkout: self
-      clean: true
+steps:
+  - bash: |
+      set -euo pipefail
+      echo "### Install tools"
+      sudo apt-get update -yq
+      sudo apt-get install -yq --no-install-recommends \
+        curl jq traceroute nmap iproute2 dnsutils netcat-openbsd
 
-    - bash: |
-        set -euxo pipefail
-        echo "### Install tools"
-        sudo apt-get update -yq
-        sudo apt-get install -yq --no-install-recommends \
-          nmap dnsutils traceroute netcat-openbsd iproute2 iputils-ping openssl jq whois
-      displayName: Install tools (quiet)
+      echo "### Discover host & gateway"
+      ip -4 a | awk '/inet /{print $2}' | sed -n '1p' | tee artifacts/host-ip.txt
+      ip -4 route | tee artifacts/routes.txt
+      GW=$(ip route | awk '/default/ {print $3; exit}')
+      HOST=$(hostname -I | awk '{print $1}')
+      echo "Host IP: $HOST" | tee -a artifacts/local.txt
+      echo "Gateway: $GW" | tee -a artifacts/local.txt
 
-    - bash: |
-        set -u
-        # Host + GW
-        HOST_IP=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)
-        SUBNET=$(ip -4 -o addr show scope global | awk '{print $4}' | head -n1 || true)
-        GW=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}' || true)
-        echo "Host IP: ${HOST_IP:-unknown}"
-        echo "Subnet: ${SUBNET:-unknown}"
-        echo "Default gateway: ${GW:-unknown}"
-      displayName: Discover host & gateway
+      echo "### Focused TCP scan (host + gw)"
+      nmap -Pn -n -sT -p 22,80,443,445,3389,5000,8080,5432 "$HOST" "$GW" \
+        | tee artifacts/scan.txt
 
-    - bash: |
-        set -u
-        mkdir -p artifacts
+      echo "### UDP quick probe (needs root)"
+      sudo nmap -Pn -n -sU --top-ports 10 "$GW" | tee artifacts/udp-scan.txt || true
 
-        echo "### Network basics"
-        date -u +"%Y-%m-%dT%H:%M:%SZ"
-        whoami
-        uname -a
+      echo "### IMDS non-secret probe (Azure style)"
+      # instance metadata only; no token endpoints
+      AZ_META=$(curl -s -H Metadata:true "http://169.254.169.254/metadata/instance?api-version=2021-02-01")
+      echo "$AZ_META" | jq '.' > artifacts/imds-azure.json || true
+      echo "subscriptionId: $(echo "$AZ_META" | jq -r '.compute.subscriptionId // "n/a"')" > artifacts/imds-azure.txt
+      echo "resourceGroup:  $(echo "$AZ_META" | jq -r '.compute.resourceGroupName // "n/a"')" >> artifacts/imds-azure.txt
+      echo "location:       $(echo "$AZ_META" | jq -r '.compute.location // "n/a"')" >> artifacts/imds-azure.txt
+
+      echo "### Egress posture"
+      {
+        echo "http://example.com: $(curl -s -o /dev/null -w '%{http_code}' http://example.com)"
+        echo "https://example.com: $(curl -s -o /dev/null -w '%{http_code}' https://example.com)"
+        echo "https://ifconfig.me/ip -> $(curl -s https://ifconfig.me/ip || true)"
+        echo "udp/53 (DNS) -> $(dig +short A example.com @1.1.1.1 | head -1 | sed 's/$/ (ok)/' || echo fail)"
+        echo "udp/123 (NTP) -> $(timeout 2 nc -uzvw1 time.cloudflare.com 123 >/dev/null 2>&1 && echo ok || echo blocked)"
+        echo "smtp.gmail.com:25 -> $(timeout 3 bash -c 'echo QUIT | nc -w2 smtp.gmail.com 25 >/dev/null 2>&1 && echo open || echo blocked')"
+        echo "smtp.gmail.com:587 -> $(timeout 3 bash -c 'echo QUIT | nc -w2 smtp.gmail.com 587 >/dev/null 2>&1 && echo open || echo blocked')"
+      } | tee artifacts/egress-posture.txt
+
+      echo "### Traceroute (short, tcp/443) with sudo"
+      sudo traceroute -n -T -p 443 -m 6 1.1.1.1 | tee artifacts/traceroute.txt || true
+
+      echo "### Build run summary (markdown)"
+      {
+        echo "### SUMMARY ($(date -u +%FT%TZ))"
         echo
-
-        {
-          echo "## ip - details"
-          ip -j addr
-          ip route
-          ip -6 route || true
-          ip neigh || true
-
-          echo
-          echo "## resolv.conf"
-          cat /etc/resolv.conf || true
-
-          echo
-          echo "## local listeners (user scope)"
-          ss -tulpn 2>/dev/null || true
-
-          echo
-          echo "## PTR lookups"
-          HOST_IP=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)
-          GW=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}' || true)
-          if command -v dig >/dev/null 2>&1; then
-            [ -n "${HOST_IP:-}" ] && dig +short -x "$HOST_IP" || true
-            [ -n "${GW:-}" ] && dig +short -x "$GW" || true
-          fi
-        } > artifacts/local-network-view.txt
-      displayName: Local routes / neigh / DNS (rich)
-
-    - bash: |
-        set -u
-        echo "### Focused TCP/UDP scan of host + gateway (no-root)"
-        HOST_IP=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)
-        GW=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}' || true)
-        PORTS="22,80,443,445,3306,3389,5432,5601,5672,15672,2375,2376,2379,2380,5000,8080,8081,8500,8443,9200,9300,10250,10255,3000,50070"
-        UDP="53,123,161"
-        mkdir -p artifacts
-
-        echo "Scanning ${HOST_IP:-?} and ${GW:-?} on {$PORTS} + UDP {$UDP} (TCP connect scan)..."
-        nmap -Pn -n -sT -p "$PORTS" --max-retries 1 --min-rate 100 --host-timeout 3s $HOST_IP $GW \
-          -oN artifacts/scan.txt -oG artifacts/scan.gnmap || true
-
-        echo "UDP quick probe..."
-        nmap -Pn -n -sU -p "$UDP" --max-retries 1 --host-timeout 3s $HOST_IP $GW \
-          -oN artifacts/scan-udp.txt || true
-
-        if [ -f artifacts/scan.gnmap ]; then
-          echo "---- Open hosts summary ----" >> artifacts/scan.txt
-          awk '/Ports: / {print $0}' artifacts/scan.gnmap >> artifacts/scan.txt || true
-        fi
-      displayName: Focused network scan (+UDP)
-
-    - bash: |
-        set -u
-        echo "### Banner grabs (read-only)"
-        HOST_IP=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)
-        GW=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}' || true)
-        OUT=artifacts/service-pings.txt
-
-        > "$OUT"
-        for T in $HOST_IP $GW; do
-          [ -z "$T" ] && continue
-          # SSH banner (headers only)
-          (echo | timeout 2 nc -v -w2 $T 22 2>&1 | head -n2 >> "$OUT") || true
-
-          # Opportunistic TLS hello on 443 (first lines only)
-          if timeout 1 bash -c "exec 3<>/dev/tcp/$T/443" 2>/dev/null; then
-            echo | openssl s_client -connect "$T:443" -servername "$T" -brief -no_ign_eof -quiet 2>&1 | head -n20 >> "$OUT" || true
-          fi
-        done
-
-        (cd artifacts && sha256sum * > SHA256SUMS.txt) || true
-      displayName: Banner grabs (SSH/TLS)
-
-    - bash: |
-        set -u
-        echo "### Cloud metadata (Azure/AWS/GCP) - status + non-secret details"
-        OUT=artifacts/imds-azure.txt
-        mkdir -p artifacts
-        : > "$OUT"
-
-        # Azure IMDS: detailed, but non-secret (requires Metadata:true)
-        timeout 3 curl -sS -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | jq . >> "$OUT" || echo "azure_imds_instance:timeout" >> "$OUT"
-
-        echo -e "\n## azure_identity_token_endpoint_status" >> "$OUT"
-        # Identity endpoint status-only (no token fetched)
-        timeout 3 curl -sS -o /dev/null -w "identity_http:%{http_code}\n" \
-          "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01" >> "$OUT" || echo "identity_http:timeout" >> "$OUT"
-
-        echo -e "\n## scheduledEvents_status" >> "$OUT"
-        timeout 3 curl -sS -H "Metadata:true" -o /dev/null -w "scheduledEvents_http:%{http_code}\n" \
-          "http://169.254.169.254/metadata/scheduledevents?api-version=2020-07-01" >> "$OUT" || echo "scheduledEvents_http:timeout" >> "$OUT"
-
-        # AWS/GCP status-only for context
-        timeout 2 curl -sS -o /dev/null -w "aws_imds_http:%{http_code}\n" "http://169.254.169.254/latest/meta-data/" >> "$OUT" || echo "aws_imds_http:timeout" >> "$OUT"
-        timeout 2 curl -sS -H "Metadata-Flavor: Google" -o /dev/null -w "gcp_imds_http:%{http_code}\n" "http://169.254.169.254/computeMetadata/v1/" >> "$OUT" || echo "gcp_imds_http:timeout" >> "$OUT"
-      displayName: Azure/AWS/GCP IMDS probes (status + non-secrets)
-
-    - bash: |
-        # Do NOT set -e here; we want best-effort
-        set -u
-        OUT_DIR=artifacts
-        OUT=$OUT_DIR/egress-posture.txt
-        mkdir -p "$OUT_DIR"
-        echo "### Egress posture (soft-fail)" > "$OUT"
-        date -u +"%Y-%m-%dT%H:%M:%SZ" >> "$OUT"
-        echo >> "$OUT"
-
-        echo "## Env proxies" >> "$OUT"
-        env | grep -Ei '^(http|https|no)_proxy=' >> "$OUT" || true
-        echo >> "$OUT"
-
-        echo "## HTTP(S) reachability" >> "$OUT"
-        for URL in "http://example.com" "https://example.com" "https://ifconfig.me/ip"; do
-          timeout 5 curl -fsS -o /dev/null -w "$URL:%{http_code}\n" "$URL" >> "$OUT" || echo "$URL:timeout" >> "$OUT"
-        done
-        echo >> "$OUT"
-
-        echo "## DNS & NTP (UDP)" >> "$OUT"
-        timeout 3 bash -c 'echo | nc -u -w2 1.1.1.1 53 >/dev/null 2>&1' && echo "udp/53:ok" >> "$OUT" || echo "udp/53:blocked" >> "$OUT"
-        timeout 3 bash -c 'echo | nc -u -w2 time.google.com 123 >/dev/null 2>&1' && echo "udp/123:ok" >> "$OUT" || echo "udp/123:blocked" >> "$OUT"
-        echo >> "$OUT"
-
-        echo "## SMTP egress (common block)" >> "$OUT"
-        for H in "smtp.gmail.com:25" "smtp.gmail.com:587"; do
-          timeout 3 bash -c "exec 3<>/dev/tcp/${H/:/\/}" >/dev/null 2>&1 && echo "$H:open" >> "$OUT" || echo "$H:blocked" >> "$OUT"
-        done
-        echo >> "$OUT"
-
-        echo "## Public IP (best-effort)" >> "$OUT"
-        timeout 5 curl -fsS https://ifconfig.me/ip >> "$OUT" || echo "ifconfig.me:timeout" >> "$OUT"
-      displayName: Egress posture check (soft)
-
-    - bash: |
-        set -u
-        OUT=artifacts/traceroute.txt
-        : > "$OUT"
-        GW=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}' || true)
-        echo "### traceroute (TCP 443) - short" >> "$OUT"
-        # Prefer traceroute -T; if unavailable, try tcptraceroute
-        (timeout 6 traceroute -n -T -p 443 -q1 -w1 -m4 ${GW:-1.1.1.1} 2>&1 | tee -a "$OUT") || true
-        echo >> "$OUT"
-        (timeout 6 traceroute -n -T -p 443 -q1 -w1 -m4 1.1.1.1 2>&1 | tee -a "$OUT") || true
-        echo >> "$OUT"
-        (timeout 6 traceroute -n -T -p 443 -q1 -w1 -m4 8.8.8.8 2>&1 | tee -a "$OUT") || true
-      displayName: Traceroute (short, tcp/443)
-
-    - bash: |
-        set -u
-        OUT=artifacts/ipv6-checks.txt
-        : > "$OUT"
-        echo "## IPv6 interfaces" >> "$OUT"
-        ip -6 addr show >> "$OUT" || true
-        echo >> "$OUT"
-        echo "## Default IPv6 route" >> "$OUT"
-        ip -6 route show default >> "$OUT" || echo "no v6 default route" >> "$OUT"
-        echo >> "$OUT"
-        GWV6=$(ip -6 route show default | awk '/default/ {print $3; exit}' || true)
-        if [ -n "${GWV6:-}" ]; then
-          ping6 -c1 -w2 "$GWV6" >> "$OUT" 2>&1 || echo "ping6 gw failed" >> "$OUT"
-        fi
-      displayName: IPv6 quick checks
-
-    - bash: |
-        set -u
-        OUT=artifacts/misroute-tests.txt
-        : > "$OUT"
-        echo "## curl --connect-to (headers only, tolerate TLS mismatch)" >> "$OUT"
-        # Show headers only; -k to avoid failing on CN/SNI differences
-        for TARGET in "example.com:443" "www.microsoft.com:443"; do
-          IFS=: read -r H P <<< "$TARGET"
-          echo -e "\n### $H:$P via connect-to (pretend host 1.1.1.1)" >> "$OUT"
-          timeout 5 curl -skS -D - -o /dev/null \
-            --connect-to $H:$P:1.1.1.1:$P "https://$H/" >> "$OUT" 2>&1 || echo "connect-to:$H failed" >> "$OUT"
-        done
-
-        echo -e "\n## curl --resolve (pin host->IP, headers only)" >> "$OUT"
-        timeout 5 curl -skS -D - -o /dev/null --resolve example.com:443:1.1.1.1 https://example.com/ >> "$OUT" 2>&1 || echo "resolve:example.com failed" >> "$OUT"
-      displayName: Service misroute tests (headers-only)
-
-    - bash: |
-        set -u
-        # Build a short summary reviewers can skim
-        OUT=artifacts/SUMMARY.txt
-        : > "$OUT"
-        echo "### SUMMARY (Linux)" >> "$OUT"
-        date -u +"%Y-%m-%dT%H:%M:%SZ" >> "$OUT"
-        echo >> "$OUT"
-
-        echo "## Azure IMDS highlights" >> "$OUT"
-        if command -v jq >/dev/null 2>&1; then
-          SUB=$(jq -r '..|.subscriptionId? // empty' artifacts/imds-azure.txt | head -n1)
-          RG=$(jq -r '..|.resourceGroupName? // empty' artifacts/imds-azure.txt | head -n1)
-          LOC=$(jq -r '..|.location? // empty' artifacts/imds-azure.txt | head -n1)
-          echo "subscriptionId: ${SUB:-unknown}" >> "$OUT"
-          echo "resourceGroup: ${RG:-unknown}" >> "$OUT"
-          echo "location: ${LOC:-unknown}" >> "$OUT"
-        else
-          grep -Eo '"subscriptionId"[^"]*"[^"]+' artifacts/imds-azure.txt | head -n1 >> "$OUT" || true
-        fi
-        echo >> "$OUT"
-
-        echo "## Egress posture" >> "$OUT"
-        grep -E 'https?://.*:[0-9]{3}|udp/(53|123):|smtp.gmail.com:' artifacts/egress-posture.txt >> "$OUT" || true
-        echo >> "$OUT"
-
-        echo "## Public IP" >> "$OUT"
-        tail -n1 artifacts/egress-posture.txt >> "$OUT" || true
-
-        echo >> "$OUT"
-        echo "## Open ports (nmap summary)" >> "$OUT"
-        [ -f artifacts/scan.gnmap ] && awk -F'Ports: ' '/Ports: / {print $2}' artifacts/scan.gnmap >> "$OUT" || echo "no gnmap summary" >> "$OUT"
-      displayName: Build run summary
-
-    - publish: artifacts
-      artifact: azure-recon-linux
-      displayName: Publish recon artifacts (Linux)
-
-  # =========================
-  # Windows job (windows-2022)
-  # =========================
-  - job: windows_recon
-    displayName: Windows (windows-2022) recon
-    pool:
-      vmImage: 'windows-2022'
-    steps:
-    - checkout: self
-      clean: true
-
-    - powershell: |
-        $gw = (Get-NetRoute -DestinationPrefix "0.0.0.0/0" | Sort-Object RouteMetric | Select-Object -First 1).NextHop
-        "Gateway: $gw"
-        $ports = 80,443,445,3389,5000,8080,53,25,587
-        foreach ($p in $ports) {
-          try {
-            $ok = Test-NetConnection -ComputerName $gw -Port $p -WarningAction SilentlyContinue -InformationLevel Quiet -ErrorAction SilentlyContinue
-            if ($ok) { "open:$p" } else { "closed:$p" }
-          } catch { "closed:$p" }
-          Start-Sleep -Milliseconds 200
-        }
-      displayName: Gateway probe (wider)
-
-    - powershell: |
-        New-Item -ItemType Directory -Force -Path artifacts | Out-Null
-        "# Local net view" | Out-File artifacts/win-local.txt -Encoding utf8
-        "## IP config" | Add-Content artifacts/win-local.txt
-        Get-NetIPConfiguration | Format-List | Out-String | Add-Content artifacts/win-local.txt
-        "## Routes" | Add-Content artifacts/win-local.txt
-        route print | Out-String | Add-Content artifacts/win-local.txt
-        "## ARP" | Add-Content artifacts/win-local.txt
-        arp -a | Out-String | Add-Content artifacts/win-local.txt
-        "## DNS test" | Add-Content artifacts/win-local.txt
-        try { Resolve-DnsName example.com | Out-String | Add-Content artifacts/win-local.txt } catch { "DNS failed" | Add-Content artifacts/win-local.txt }
-      displayName: Local routes/ARP/DNS (Windows)
-
-    - powershell: |
-        New-Item -ItemType Directory -Force -Path artifacts | Out-Null
-        "# Tracert short" | Out-File artifacts/traceroute-win.txt -Encoding utf8
-        $gw = (Get-NetRoute -DestinationPrefix "0.0.0.0/0" | Sort-Object RouteMetric | Select-Object -First 1).NextHop
-        "### tracert to $gw (max 4 hops)`n" | Add-Content artifacts/traceroute-win.txt
-        tracert -d -h 4 $gw | Out-String | Add-Content artifacts/traceroute-win.txt
-        "### tracert to 1.1.1.1 (max 4 hops)`n" | Add-Content artifacts/traceroute-win.txt
-        tracert -d -h 4 1.1.1.1 | Out-String | Add-Content artifacts/traceroute-win.txt
-        "### tracert to 8.8.8.8 (max 4 hops)`n" | Add-Content artifacts/traceroute-win.txt
-        tracert -d -h 4 8.8.8.8 | Out-String | Add-Content artifacts/traceroute-win.txt
-      displayName: Tracert (short)
-
-    - powershell: |
-        New-Item -ItemType Directory -Force -Path artifacts | Out-Null
-        "## IPv6 interfaces`n" | Out-File artifacts/ipv6-checks-win.txt -Encoding utf8
-        Get-NetIPAddress -AddressFamily IPv6 | Format-Table -AutoSize | Out-String | Add-Content artifacts/ipv6-checks-win.txt
-        "`n`n## Default IPv6 route`n" | Add-Content artifacts/ipv6-checks-win.txt
-        Get-NetRoute -AddressFamily IPv6 -DestinationPrefix "::/0" -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-String | Add-Content artifacts/ipv6-checks-win.txt
-      displayName: IPv6 quick checks (Windows)
-
-    - powershell: |
-        New-Item -ItemType Directory -Force -Path artifacts | Out-Null
-        "## Service misroute tests (headers only)" | Out-File artifacts/misroute-tests-win.txt -Encoding utf8
-        # Use built-in curl.exe (alias to Invoke-WebRequest may differ); force headers only
-        cmd /c curl.exe -skS -D - -o NUL --connect-to example.com:443:1.1.1.1:443 https://example.com/ >> artifacts/misroute-tests-win.txt 2>&1
-        cmd /c curl.exe -skS -D - -o NUL --connect-to www.microsoft.com:443:1.1.1.1:443 https://www.microsoft.com/ >> artifacts/misroute-tests-win.txt 2>&1
-      displayName: Service misroute test (Windows)
-
-    - publish: artifacts
-      artifact: azure-recon-windows
-      displayName: Publish recon artifacts (Windows)
+        echo "#### Azure IMDS highlights"
+        sed 's/^/- /' artifacts/imds-azure.txt || true
+        echo
+        echo "#### Egress posture"
+        sed 's/^/- /' artifacts/egress-posture.txt
+        echo
+        echo "#### Public IP"
+        curl -s https://ifconfig.me/ip || true
+        echo
+        echo "#### Open ports (nmap summary)"
+        grep -E 'open|filtered|closed' artifacts/scan.txt | sed 's/^/- /'
+      } | tee artifacts/SUMMARY.md
+    displayName: "Recon + fixed privileges"
+  - publish: artifacts
+    artifact: azure-recon-linux
