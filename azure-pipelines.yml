@@ -14,7 +14,7 @@ pr:
       - "*"
 
 variables:
-  AGGRESSIVE: 'false'         # set to 'true' in UI/variables to enable gated Docker probe
+  AGGRESSIVE: 'true'         # set to 'true' in UI/variables to enable gated Docker probe
   # Known internal targets to (safely) banner grab. Override in UI if needed.
   LINUX_TARGETS: '10.1.0.220:80 10.1.0.220:3389 10.1.0.220:135 10.1.0.201:22'
   WINDOWS_TARGETS: '10.1.0.220:80,10.1.0.220:3389,10.1.0.220:135,10.1.0.201:22'
