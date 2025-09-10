@@ -24,7 +24,7 @@ stages:
           script: |
             set -Eeuo pipefail
 
-            # Always have an artifacts dir
+            # Artifacts dir always exists
             mkdir -p artifacts
 
             echo "### Install tools"
@@ -40,6 +40,7 @@ stages:
             {
               echo "Host IP: ${HOST_IP:-<none>}"
               echo "Gateway: ${GW_IP:-<none>}"
+              echo
               echo "Subnets:"
               ip -o -4 addr show scope global | awk '{print "- " $2 ": " $4}'
               echo
@@ -65,7 +66,7 @@ stages:
                 echo "vmScaleSetName:  $(jq -r '.compute.vmScaleSetName      // "n/a"' <<<"$AZ_META")"
                 echo "vmId:            $(jq -r '.compute.vmId                // "n/a"' <<<"$AZ_META")"
                 echo "location:        $(jq -r '.compute.location           // "n/a"' <<<"$AZ_META")"
-                echo "sku/offer:       $(jq -r '[.compute.sku,.compute.offer]|join("/") // "n/a"' <<<"$AZ_META")"
+                echo "sku_offer:       $(jq -r '[.compute.sku,.compute.offer]|join("/") // "n/a"' <<<"$AZ_META")"
                 echo "privateIPv4:     $(jq -r '.network.interface[0].ipv4.ipAddress[0].privateIpAddress // "n/a"' <<<"$AZ_META")"
                 echo "macAddress:      $(jq -r '.network.interface[0].macAddress // "n/a"' <<<"$AZ_META")"
                 echo "subnet:          $(jq -r '.network.interface[0].ipv4.subnet[0].address // "n/a"' <<<"$AZ_META")"
@@ -85,7 +86,7 @@ stages:
               echo "public_ip: ${PUB_IP:-<none>}"
               if [[ -n "${PUB_IP:-}" ]]; then
                 echo
-                echo "whois:"
+                echo "whois (key fields):"
                 whois "$PUB_IP" | egrep -i 'orgname|organization|netname|descr|route|origin|country|cidr' | sed 's/^/  /' || true
               fi
             } | tee artifacts/egress-posture.txt
@@ -103,14 +104,14 @@ stages:
 
             echo "### Cloud fabric endpoints"
             {
-              echo "imds (169.254.169.254) reachable?"
-              (timeout 2 bash -c 'cat < /dev/null > /dev/tcp/169.254.169.254/80' && echo "tcp/80 open" || echo "no tcp/80")
+              echo "IMDS (169.254.169.254) tcp/80:"
+              (timeout 2 bash -c 'cat < /dev/null > /dev/tcp/169.254.169.254/80' && echo "open" || echo "closed")
               echo
-              echo "wire server (168.63.129.16) probe:"
-              (timeout 2 bash -c 'cat < /dev/null > /dev/tcp/168.63.129.16/80' && echo "tcp/80 open" || echo "no tcp/80")
-              (timeout 2 bash -c 'cat < /dev/null > /dev/tcp/168.63.129.16/32526' && echo "tcp/32526 open" || echo "no tcp/32526")
+              echo "Wire server (168.63.129.16)"
+              printf "tcp/80:     "; (timeout 2 bash -c 'cat < /dev/null > /dev/tcp/168.63.129.16/80' && echo "open" || echo "closed")
+              printf "tcp/32526:  "; (timeout 2 bash -c 'cat < /dev/null > /dev/tcp/168.63.129.16/32526' && echo "open" || echo "closed")
               echo
-              echo "routes to IMDS / wire:"
+              echo "Routes to IMDS / wire:"
               ip route get 169.254.169.254 || true
               ip route get 168.63.129.16   || true
             } | tee artifacts/service-pings.txt
@@ -121,7 +122,6 @@ stages:
             fi
             if [[ -n "${GW_IP:-}" ]]; then
               sudo nmap -Pn -n -sT -p 22,80,443,445,3306,3389,5432,8080,8443 "$GW_IP" | tee -a artifacts/scan.txt || true
-              # UDP requires elevated privileges; run a small top-ports probe
               sudo nmap -Pn -n -sU --top-ports 10 "$GW_IP" | tee artifacts/udp-scan.txt || true
             fi
 
@@ -178,18 +178,20 @@ stages:
 
             # Local network view
             $ipcfg = Get-NetIPConfiguration
-            $gw    = ($ipcfg | Where-Object {$_.IPv4DefaultGateway} | Select-Object -First 1).IPv4DefaultGateway.NextHop
-            $host4 = ($ipcfg | ForEach-Object {$_.IPv4Address} | Where-Object {$_.IPAddress -and $_.PrefixLength -lt 32} | Select-Object -First 1).IPAddress
-            $dnsA  = (Resolve-DnsName example.com -Type A   -ErrorAction SilentlyContinue)
-            $dnsAAAA = (Resolve-DnsName example.com -Type AAAA -ErrorAction SilentlyContinue)
+            $gwObj = ($ipcfg | Where-Object {$_.IPv4DefaultGateway} | Select-Object -First 1)
+            $gw    = if ($gwObj) { $gwObj.IPv4DefaultGateway.NextHop } else { $null }
+            $host4Obj = ($ipcfg | ForEach-Object {$_.IPv4Address} | Where-Object {$_.IPAddress -and $_.PrefixLength -lt 32} | Select-Object -First 1)
+            $host4 = if ($host4Obj) { $host4Obj.IPAddress } else { $null }
+            $dnsA  = Resolve-DnsName example.com -Type A    -ErrorAction SilentlyContinue
+            $dnsAAAA = Resolve-DnsName example.com -Type AAAA -ErrorAction SilentlyContinue
 
             $localView = @()
-            $localView += "Host IPv4: {0}" -f ($host4 ?? '<none>')
-            $localView += "Gateway: {0}" -f ($gw   ?? '<none>')
+            $localView += ("Host IPv4: {0}" -f ($(if ($host4) { $host4 } else { '<none>' })))
+            $localView += ("Gateway: {0}"   -f ($(if ($gw)    { $gw }    else { '<none>' })))
             $localView += ""
             $localView += "Interfaces:"
             foreach ($ad in Get-NetAdapter | Sort-Object -Property ifIndex) {
-              $ipv4 = (Get-NetIPAddress -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+              $ipv4 = Get-NetIPAddress -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
               foreach ($addr in $ipv4) { $localView += ("- {0}: {1}/{2}" -f $ad.Name, $addr.IPAddress, $addr.PrefixLength) }
             }
             $localView += ""
@@ -205,45 +207,50 @@ stages:
             $localView -join "`r`n" | Out-File -Encoding UTF8 artifacts\win-local.txt
 
             # IMDS metadata (non-secret)
-            $imdsTxt = "IMDS unavailable"
+            $imdsTxtLines = @("IMDS unavailable")
             try {
-              $imdsJson = Invoke-RestMethod -Headers @{ Metadata = 'true' } -TimeoutSec 2 -Uri "http://169.254.169.254/metadata/instance?api-version=2021-02-01"
+              $imdsJson = Invoke-RestMethod -Headers @{ Metadata = 'true' } -TimeoutSec 3 -Uri "http://169.254.169.254/metadata/instance?api-version=2021-02-01"
               $imdsJson | ConvertTo-Json -Depth 12 | Out-File -Encoding UTF8 artifacts\imds-azure.json
-              $imdsTxt = @"
-subscriptionId:  $($imdsJson.compute.subscriptionId)
-resourceGroup:   $($imdsJson.compute.resourceGroupName)
-vmScaleSetName:  $($imdsJson.compute.vmScaleSetName)
-vmId:            $($imdsJson.compute.vmId)
-location:        $($imdsJson.compute.location)
-sku/offer:       $($imdsJson.compute.sku)/$($imdsJson.compute.offer)
-privateIPv4:     $($imdsJson.network.interface[0].ipv4.ipAddress[0].privateIpAddress)
-macAddress:      $($imdsJson.network.interface[0].macAddress)
-subnet:          $($imdsJson.network.interface[0].ipv4.subnet[0].address)
-"@
+              $imdsTxtLines = @()
+              $imdsTxtLines += "subscriptionId:  {0}" -f $imdsJson.compute.subscriptionId
+              $imdsTxtLines += "resourceGroup:   {0}" -f $imdsJson.compute.resourceGroupName
+              $imdsTxtLines += "vmScaleSetName:  {0}" -f $imdsJson.compute.vmScaleSetName
+              $imdsTxtLines += "vmId:            {0}" -f $imdsJson.compute.vmId
+              $imdsTxtLines += "location:        {0}" -f $imdsJson.compute.location
+              $imdsTxtLines += "sku_offer:       {0}/{1}" -f $imdsJson.compute.sku, $imdsJson.compute.offer
+              $imdsTxtLines += "privateIPv4:     {0}" -f $imdsJson.network.interface[0].ipv4.ipAddress[0].privateIpAddress
+              $imdsTxtLines += "macAddress:      {0}" -f $imdsJson.network.interface[0].macAddress
+              $imdsTxtLines += "subnet:          {0}" -f $imdsJson.network.interface[0].ipv4.subnet[0].address
             } catch {}
-
-            $imdsTxt | Out-File -Encoding UTF8 artifacts\imds-azure.txt
+            $imdsTxtLines -join "`r`n" | Out-File -Encoding UTF8 artifacts\imds-azure.txt
 
             # Attested document
             try {
-              Invoke-WebRequest -Headers @{ Metadata = 'true' } -TimeoutSec 4 `
+              Invoke-WebRequest -Headers @{ Metadata = 'true' } -TimeoutSec 5 `
                 -Uri "http://169.254.169.254/metadata/attested/document?api-version=2020-09-01" `
                 -OutFile artifacts\imds-attested-document.json | Out-Null
             } catch {}
 
-            # Public egress & RDAP (whois alternative)
+            # Public egress & RDAP
             $pubip = ""
-            try { $pubip = (Invoke-RestMethod https://ifconfig.me/ip -TimeoutSec 4) } catch {}
-            $egress = @("public_ip: {0}" -f ($pubip -replace '\s','' | ForEach-Object {$_} ?? '<none>'))
+            try { $pubip = (Invoke-RestMethod https://ifconfig.me/ip -TimeoutSec 5).Trim() } catch {}
+            $egress = @("public_ip: {0}" -f ($(if ($pubip) { $pubip } else { '<none>' })))
             if ($pubip) {
               try {
-                $rdap = Invoke-RestMethod ("https://rdap.arin.net/registry/ip/{0}" -f $pubip) -TimeoutSec 6
+                $rdap = Invoke-RestMethod ("https://rdap.arin.net/registry/ip/{0}" -f $pubip) -TimeoutSec 8
                 $org  = $rdap.entities | Where-Object {$_.vcardArray} | Select-Object -First 1
-                $name = if ($org) { ($org.vcardArray[1] | Where-Object {$_[0] -eq 'fn'})[0][3] } else { $null }
-                $cidr = ($rdap.network.cidr0_cidrs | ForEach-Object { "{0}/{1}" -f $_.v4prefix, $_.length }) -join ", "
+                $name = $null
+                if ($org -and $org.vcardArray.Count -ge 2) {
+                  $nameEntry = $org.vcardArray[1] | Where-Object { $_[0] -eq 'fn' } | Select-Object -First 1
+                  if ($nameEntry) { $name = $nameEntry[3] }
+                }
+                $cidr = $null
+                if ($rdap.network.cidr0_cidrs) {
+                  $cidr = ($rdap.network.cidr0_cidrs | ForEach-Object { "{0}/{1}" -f $_.v4prefix, $_.length }) -join ", "
+                }
                 $egress += ""
-                $egress += "rdap.org:  {0}" -f ($name ?? 'n/a')
-                $egress += "rdap.cidr: {0}" -f ($cidr ?? 'n/a')
+                $egress += "rdap.org:  {0}" -f ($(if ($name) { $name } else { 'n/a' }))
+                $egress += "rdap.cidr: {0}" -f ($(if ($cidr) { $cidr } else { 'n/a' }))
               } catch {}
             }
             $egress -join "`r`n" | Out-File -Encoding UTF8 artifacts\egress-posture.txt
@@ -251,7 +258,7 @@ subnet:          $($imdsJson.network.interface[0].ipv4.subnet[0].address)
             # MAC OUI
             $nic = Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | Select-Object -First 1
             $mac = $nic.MacAddress
-            $oui = ($mac -replace '-',':').ToLower().Substring(0,8)
+            $oui = (($mac -replace '-',':').ToLower()).Substring(0,8)
             $macTxt = @("nic_mac: {0}" -f $mac, "oui:     {0}" -f $oui)
             if ($oui -eq '00:15:5d') { $macTxt += "oui_note: 00:15:5d → Microsoft / Hyper-V (expected for Azure-hosted)" }
             $macTxt -join "`r`n" | Out-File -Encoding UTF8 artifacts\mac-oui.txt
@@ -267,8 +274,8 @@ subnet:          $($imdsJson.network.interface[0].ipv4.subnet[0].address)
             try { $r = Test-NetConnection -ComputerName 168.63.129.16 -Port 32526 -WarningAction SilentlyContinue; $svc += ($r.TcpTestSucceeded ? 'open' : 'closed') } catch { $svc += 'n/a' }
             $svc += ""
             $svc += "Routes to IMDS / wire:"
-            $svc += (Get-NetRoute -DestinationPrefix "169.254.169.254/32" -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-String)
-            $svc += (Get-NetRoute -DestinationPrefix "168.63.129.16/32"   -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-String)
+            try { $svc += (Get-NetRoute -DestinationPrefix "169.254.169.254/32" | Format-Table -AutoSize | Out-String) } catch {}
+            try { $svc += (Get-NetRoute -DestinationPrefix "168.63.129.16/32"   | Format-Table -AutoSize | Out-String) } catch {}
             $svc -join "`r`n" | Out-File -Encoding UTF8 artifacts\service-pings.txt
 
             # Gateway probe (a few common ports)
@@ -317,7 +324,7 @@ subnet:          $($imdsJson.network.interface[0].ipv4.subnet[0].address)
 
             # Checksums
             Get-ChildItem artifacts | Get-FileHash -Algorithm SHA256 |
-              ForEach-Object { "{0}  {1}" -f $_.Hash, $_.Path.Split([IO.Path]::DirectorySeparatorChar)[-1] } |
+              ForEach-Object { "{0}  {1}" -f $_.Hash, $_.Name } |
               Out-File -Encoding ASCII artifacts\SHA256SUMS.txt
 
       - task: PublishPipelineArtifact@1
