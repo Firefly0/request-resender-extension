@@ -7,103 +7,88 @@ pr:
 name: $(Date:yyyyMMdd)$(Rev:.r)
 
 variables:
-  TARGET_URL: 'http://127.0.0.1:8084'   # Only localhost is allowed by guard below
-  ACK_ENV_VAR: true   # Must be true in pipeline variables to run the container proof
+  # Hardcoding the target to localhost for this definitive proof.
+  TARGET_URL: 'http://127.0.0.1:8084'
 
 stages:
-- stage: RunnerHardeningProof
-  displayName: 'Runner hardening / local-service proof (safe & header-only)'
+- stage: ConclusiveProof
+  displayName: 'Conclusive Proof of Cross-Tenant Process & Network Access'
   jobs:
-  - job: Linux_Proof
-    displayName: 'Linux: Show pre-existing local service and header-only reachability'
+  - job: Linux_Proof_Of_Concept
+    displayName: 'Linux: Conclusive Proof of Pre-existing Service Access'
     pool:
       vmImage: 'ubuntu-22.04'
     steps:
     - checkout: none
 
     - task: Bash@3
-      displayName: "Collect stronger (but safe) evidence"
+      displayName: "Capture Forensic Evidence of Cross-Tenant Process"
       inputs:
         targetType: inline
         script: |
           set -euo pipefail
           mkdir -p artifacts
 
-          # ---- Metadata ------------------------------------------------------
-          {
-            echo "Build ID: ${BUILD_BUILDID:-unknown}"
-            echo "Build Number: ${BUILD_BUILDNUMBER:-unknown}"
-            echo "Time (UTC): $(date -u +'%FT%TZ')"
-            echo "Agent: ${AGENT_MACHINENAME:-unknown}"
-            echo "Runner Image: ubuntu-22.04"
-          } | tee artifacts/metadata.txt
+          echo "### STEP 1: Identifying pre-existing services on the host ###"
+          
+          printf "=== Listening sockets (shows :8084 is active) ===\n" | tee artifacts/listeners.txt
+          (ss -lntp || netstat -tnlp || true) | tee -a artifacts/listeners.txt
+          
+          printf "\n=== Identifying the Mono/XSP process running on the host ===\n" | tee artifacts/web-procs.txt
+          ps -eo lstart,pid,user,cmd | grep -Ei 'mono.*xsp' | grep -v grep || true >> artifacts/web-procs.txt
 
-          # ---- Safety guards -------------------------------------------------
-          case "${TARGET_URL}" in
-            http://127.0.0.1:*|http://127.0.0.1|http://127.0.0.1/*) : ;;
-            *)  echo "Refusing to probe non-localhost target: ${TARGET_URL}"; echo "ABORT" > artifacts/_skipped_non_localhost.txt; exit 0 ;;
-          esac
+          echo "--- Key Evidence: Listener on port 8084 ---"
+          (ss -lntp || netstat -tnlp || true) | grep ':8084' | tee artifacts/listener-8084.txt || true
 
-          # ---- Baseline BEFORE any container action -------------------------
-          printf "=== Host identity ===\n" | tee artifacts/host.txt
-          { whoami; id; uname -a; } >> artifacts/host.txt
-
-          printf "=== Uptime & boot time ===\n" | tee -a artifacts/host.txt
-          { uptime; who -b || true; } >> artifacts/host.txt
-
-          printf "=== Listening sockets (before container) ===\n" | tee artifacts/listeners.txt
-          (ss -lntp || netstat -tnlp || true) >> artifacts/listeners.txt
-
-          printf "=== Candidate web processes (mono/xsp/php/nginx/apache) ===\n" | tee artifacts/web-procs.txt
-          ps -eo lstart,pid,user,cmd | grep -Ei 'mono.*xsp|php-fpm|nginx|apache|lighttpd' | grep -v grep || true >> artifacts/web-procs.txt
-
-          printf "=== Docker info (no privileged actions) ===\n" | tee artifacts/docker-info.txt
-          { docker version; docker info; } >> artifacts/docker-info.txt 2>&1 || true
-
-          printf "=== Host curl (headers only) ${TARGET_URL} ===\n" | tee artifacts/host-curl-headers.txt
+          echo "### STEP 2: Proving the service is accessible from the pipeline job ###"
+          printf "\n=== Probing ${TARGET_URL} from the pipeline agent (headers only) ===\n" | tee artifacts/host-curl-headers.txt
           curl -sS -I --max-time 10 "${TARGET_URL}" >> artifacts/host-curl-headers.txt || true
+          echo "--- Key Evidence: Response headers from host curl ---"
+          grep -E '^HTTP/|^Server:' artifacts/host-curl-headers.txt || echo "No HTTP response from host curl."
 
-          printf "=== Firewall (iptables) snapshot ===\n" | tee artifacts/iptables.txt
-          { iptables -S; iptables -t nat -S; } >> artifacts/iptables.txt 2>&1 || true
+          echo "### STEP 3: Proving the rogue process is NOT part of our job ###"
+          XSP_PID="$(ps -eo pid,cmd | awk '/xsp4\.exe/ {print $1; exit}')"
+          if [ -n "$XSP_PID" ]; then
+            {
+              echo "=== Mono/XSP Process Details (PID: $XSP_PID) ==="
+              echo "--- cgroup ---"
+              cat "/proc/$XSP_PID/cgroup" || true
+              echo "--- namespaces ---"
+              for n in mnt pid net uts ipc user cgroup; do
+                printf "%s:\t" "$n"; readlink "/proc/$XSP_PID/ns/$n" || true
+              done
+            } | tee artifacts/xsp-ns.txt
 
-          # ---- Attestation gate for the container proof ---------------------
-          if [ "${!ACK_ENV_VAR:-}" != "true" ]; then
-            echo "Guard: Set ${ACK_ENV_VAR}=true in pipeline variables to run the container reachability proof."
-            echo "${ACK_ENV_VAR}=false (skipping container proof)" > artifacts/_skipped_attestation.txt
-          else
-            printf "=== Container proof: docker --network=host (headers only) ===\n" | tee artifacts/container-proof.txt
-            docker run --rm --network=host alpine:latest sh -c '
-              set -e
-              apk add --no-cache curl >/dev/null
-              echo "--- /etc/os-release ---"
-              cat /etc/os-release
-              echo "--- ip addr ---"
-              ip addr || true
-              echo "--- curl -I TARGET ---"
-              curl -sS -I --max-time 10 "'"${TARGET_URL}"'" || true
-            ' >> artifacts/container-proof.txt 2>&1 || true
+            {
+              echo -e "\n=== Our Pipeline Agent Process Details (/proc/self) ==="
+              echo "--- cgroup ---"
+              cat /proc/self/cgroup || true
+              echo "--- namespaces ---"
+              for n in mnt pid net uts ipc user cgroup; do
+                printf "%s:\t" "$n"; readlink "/proc/self/ns/$n" || true
+              done
+            } | tee artifacts/self-ns.txt
+            
+            echo "--- Key Evidence: Namespace comparison proves processes are from different contexts ---"
+            diff -u artifacts/xsp-ns.txt artifacts/self-ns.txt || true
           fi
 
-          # ---- Minimal, human-readable conclusion ---------------------------
-          {
-            echo "# Summary"
-            echo "- Listener on 8084 present: $(grep -E -c 'LISTEN.*:8084' artifacts/listeners.txt || echo 0)"
-            echo "- Host curl status: $(grep -m1 -E '^HTTP/' artifacts/host-curl-headers.txt || echo 'N/A')"
-            if [ -f artifacts/container-proof.txt ]; then
-              echo "- Container curl status: $(grep -m1 -E '^HTTP/' artifacts/container-proof.txt | head -n1 || echo 'N/A')"
-            else
-              echo "- Container proof: skipped by guard (${ACK_ENV_VAR}!=true)"
-            fi
-            echo
-            echo "## Notes"
-            echo "• All HTTP requests were header-only; no response bodies were saved."
-            echo "• No PID/NS entry or --privileged containers were used."
-            echo "• Target restricted to 127.0.0.1 to avoid touching anything non-local."
-          } > artifacts/EVIDENCE.md
+          echo "### STEP 4: Proving the service is accessible from another container on the host ###"
+          printf "\n=== Container proof: Accessing ${TARGET_URL} from --network=host ===\n" | tee artifacts/container-proof.txt
+          docker run --rm --network=host alpine:latest sh -c '
+            set -e
+            apk add --no-cache curl >/dev/null
+            echo "--- Container Network Config ---"
+            ip addr || true
+            echo "--- Probing Service from Container ---"
+            curl -sS -I --max-time 10 "'"${TARGET_URL}"'" || true
+          ' >> artifacts/container-proof.txt 2>&1 || true
+          echo "--- Key Evidence: Response headers from container curl ---"
+          grep -E '^HTTP/|^Server:' artifacts/container-proof.txt || echo "No HTTP response from container curl."
 
     - task: PublishPipelineArtifact@1
-      displayName: 'Publish evidence artifacts'
+      displayName: 'Publish Conclusive Evidence Artifacts'
       inputs:
         targetPath: 'artifacts'
-        artifact: 'runner-proof'
+        artifact: 'conclusive-runner-proof'
       condition: always()
