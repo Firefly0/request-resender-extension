@@ -1,253 +1,150 @@
-# azure-pipelines.yml
+name: $(Date:yyyyMMdd).$(Rev:r)
 
 trigger:
-- main
+  branches:
+    include: [ main ]
 
 pr:
-- main
+  branches:
+    include: [ main ]
 
 variables:
-  VM_IMAGE: 'ubuntu-22.04'
-  RUN_MARK: 'MARK_$(Build.BuildId)_$(System.JobAttempt)'
-  SYMLINK_ARCHIVE_NAME: 'symlink_payloads.tgz'
+  ARTIFACT_DIR_SYMLINK: $(Build.SourcesDirectory)/artifacts-symlink
+  ARTIFACT_DIR_TOOLCACHE: $(Build.SourcesDirectory)/artifacts-toolcache
+  ARTIFACT_DIR_ARGV: $(Build.SourcesDirectory)/artifacts-argv
+  SYMLINK_TGZ: symlink_payloads.tgz
 
 stages:
-- stage: VulnProbes
-  displayName: Forensics & Probes
+# 1) Build/seed and publish artifacts
+- stage: BuildAndPublish
+  displayName: Build, seed, and publish
   jobs:
-
-  - job: seed_and_publish
-    displayName: "Seed: toolcache, symlinks, and argv leak"
+  - job: ubuntu
+    displayName: Ubuntu 22.04
     pool:
-      vmImage: $(VM_IMAGE)
+      vmImage: ubuntu-22.04
     steps:
-      - bash: |
-          set -euo pipefail
-          echo "== Host identity & timing =="
-          date -u
-          uname -a
-          id
-          echo "== /etc fingerprints =="
-          echo "--- /etc/machine-id ---"; cat /etc/machine-id || true
-          echo "--- /etc/os-release ---"; sed -n '1,200p' /etc/os-release || true
-          echo
-          echo "== Prepare artifacts tree =="
-          rm -rf artifacts-* out || true
-          mkdir -p artifacts-symlink artifacts-argv artifacts-toolcache artifacts-seed out
-          echo "$(RUN_MARK) $(Build.QueuedBy) $(Build.SourceVersion)" | tee artifacts-seed/run_mark.txt
+    - checkout: self
+      clean: true
 
-          echo
-          echo "== Symlink payloads (safe targets) =="
-          ln -s /etc/hosts artifacts-symlink/abs_to_etc_hosts
-          mkdir -p artifacts-symlink/deep/inside
-          ( cd artifacts-symlink/deep/inside && ln -s ../../../../etc/passwd rel_escape_to_etc_passwd )
-          touch 'artifacts-symlink/..__not_traversal__'
+    - bash: |
+        set -euo pipefail
+        echo "== Host identity & timing =="
+        date -u
+        uname -a
+        id
 
-          echo
-          echo "== Toolcache seed & PATH-hijack attempt =="
-          echo "AGENT_TOOLSDIRECTORY=${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}"
-          TC_DIR="${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}"
-          SHADOW_DIR="$TC_DIR/shadow/bin"
-          mkdir -p "$SHADOW_DIR"
-          cat > "$SHADOW_DIR/node" <<'EOF'
-          #!/usr/bin/env bash
-          echo "[shadow-node] invoked: $0 $*" >> "$HOME/shadow-invocations.log"
-          if command -v /usr/bin/node >/dev/null 2>&1; then exec /usr/bin/node "$@"; else exec node "$@"; fi
-          EOF
-          cat > "$SHADOW_DIR/echo" <<'EOF'
-          #!/usr/bin/env bash
-          printf "hello-from-shadow "
-          exec /usr/bin/echo "$@"
-          EOF
-          chmod +x "$SHADOW_DIR/node" "$SHADOW_DIR/echo"
+        echo "== Prepare artifacts tree =="
+        mkdir -p "$ARTIFACT_DIR_SYMLINK/deep/inside" "$ARTIFACT_DIR_TOOLCACHE" "$ARTIFACT_DIR_ARGV"
+        echo "MARK_$(Build.BuildId) $(Build.Repository.Provider) $(Build.SourceVersion)" | tee "$ARTIFACT_DIR_TOOLCACHE/MARK.txt"
 
-          for p in /var/tmp /tmp "$TC_DIR" /usr/local/share ; do
-            fn="$p/.${RUN_MARK}"
-            (echo "${RUN_MARK} $(date -u +%FT%TZ)" > "$fn" 2>/dev/null && echo "wrote $fn") || echo "no perms for $p"
-          done
+        echo "== Symlink payloads =="
+        (cd "$ARTIFACT_DIR_SYMLINK/deep/inside" && ln -s ../../../../../etc/passwd rel_escape_to_etc_passwd)
+        (cd "$ARTIFACT_DIR_SYMLINK" && find . -maxdepth 3 -type l -ls) | tee "$ARTIFACT_DIR_SYMLINK/MANIFEST.txt"
 
-          (ls -ld "$TC_DIR" && ls -la "$TC_DIR") > artifacts-toolcache/toolcache_listing.txt
+        echo "== Pack the symlink payloads (don’t dereference) =="
+        (cd "$ARTIFACT_DIR_SYMLINK" && tar -czf "../$SYMLINK_TGZ" .)
+        ls -l "$(Build.SourcesDirectory)/$SYMLINK_TGZ"
 
-          echo
-          echo "== Secret-argv leak probe setup =="
-          if [ -z "${DUMMY_SECRET:-}" ]; then
-            gen="dummy-$(openssl rand -hex 8 || date +%s%N)"
-            echo "##vso[task.setvariable variable=DUMMY_SECRET;issecret=true]$gen"
-            echo "(Set runtime secret DUMMY_SECRET)"
+        echo "== Toolcache seed (no elevation) =="
+        echo "AGENT_TOOLSDIRECTORY=$AGENT_TOOLSDIRECTORY"
+        for d in /var/tmp /tmp "$AGENT_TOOLSDIRECTORY" /usr/local/share ; do
+          if [ -w "$d" ]; then
+            echo "wrote $(date -Iseconds)" > "$d/.MARK_$(Build.BuildId)" || true
           else
-            echo "(Using pre-provided DUMMY_SECRET)"
+            echo "no perms for $d" | tee -a "$ARTIFACT_DIR_TOOLCACHE/MARK.txt"
           fi
-        displayName: "Seed: identify, symlinks, toolcache, and secret init"
+        done
 
-      - bash: |
-          set -euo pipefail
-          # 🔧 Pack symlink folder so PublishPipelineArtifact doesn't touch symlinks directly
-          tar -czf "$(Build.SourcesDirectory)/$(SYMLINK_ARCHIVE_NAME)" -C artifacts-symlink .
-          ls -l "$(Build.SourcesDirectory)/$(SYMLINK_ARCHIVE_NAME)"
-        displayName: "Pack symlink payloads (tar.gz)"
+        echo "== Secret handling demo (no ARGV leak) =="
+        set +x  # never echo commands when touching secrets
+        : "${DUMMY_SECRET:?DUMMY_SECRET pipeline variable must be set}"
 
-      - task: PublishPipelineArtifact@1
-        displayName: "Publish: toolcache proof"
-        inputs:
-          targetPath: artifacts-toolcache
-          artifactName: toolcache-proof
-          publishLocation: pipeline
+        # Simulate a tool that reads secret from env (no CLI args):
+        python - <<'PY'
+        import os, time
+        assert os.environ.get("DUMMY_SECRET"), "missing secret"
+        time.sleep(1)
+        PY
 
-      - task: PublishPipelineArtifact@1
-        displayName: "Publish: symlink payloads (tar.gz)"
-        inputs:
-          targetPath: '$(Build.SourcesDirectory)/$(SYMLINK_ARCHIVE_NAME)'   # <- publish the single file
-          artifactName: symlink-proof
-          publishLocation: pipeline
+        echo "argv-check: scan process table to ensure the secret is not present"
+        if ps auxww | grep -F -- "$DUMMY_SECRET" | grep -v grep > "$ARTIFACT_DIR_ARGV/ps_secret_matches.txt"; then
+          echo "ERROR: secret string appeared in process args" | tee "$ARTIFACT_DIR_ARGV/RESULT.txt"
+          exit 1
+        else
+          echo "OK: secret not found in process args" | tee "$ARTIFACT_DIR_ARGV/RESULT.txt"
+        fi
 
-      - bash: |
-          set -euo pipefail
-          echo "== First-party-style argv exposure check =="
-          echo "Marker: ARGV_LEAK_$(Build.BuildId)_$$" | tee artifacts-argv/marker.txt
+        echo "== Summaries =="
+        cp "$(Build.SourcesDirectory)/$SYMLINK_TGZ" "$ARTIFACT_DIR_SYMLINK/"
+      displayName: Seed: identify, symlinks, toolcache, and secret init
+      env:
+        DUMMY_SECRET: $(DUMMY_SECRET)
 
-          if [ -z "${DUMMY_SECRET:-}" ]; then
-            echo "No DUMMY_SECRET available; skipping argv test." | tee -a artifacts-argv/argv.txt
-            exit 0
-          fi
+    - task: PublishPipelineArtifact@1
+      displayName: Publish: toolcache proof
+      inputs:
+        targetPath: $(ARTIFACT_DIR_TOOLCACHE)
+        artifact: toolcache-proof
 
-          ( sleep 0.5; ps -eo pid,ppid,user,cmd | tee artifacts-argv/ps_snapshot.txt | grep -F -- "$DUMMY_SECRET" && echo "FOUND in ps" | tee -a artifacts-argv/argv.txt || echo "NOT_FOUND in ps" | tee -a artifacts-argv/argv.txt ) &
-          /usr/bin/bash -c 'sleep 2' "${DUMMY_SECRET}" || true
+    - task: PublishPipelineArtifact@1
+      displayName: Publish: symlink payloads (as .tgz)
+      inputs:
+        targetPath: $(Build.SourcesDirectory)/$(SYMLINK_TGZ)
+        artifact: symlink-proof
 
-          for pid in $(pgrep -f sleep || true); do
-            tr '\0' ' ' < /proc/$pid/cmdline | tee -a artifacts-argv/cmdlines.txt || true
-          done
+    - task: PublishPipelineArtifact@1
+      displayName: Publish: argv leak proof
+      inputs:
+        targetPath: $(ARTIFACT_DIR_ARGV)
+        artifact: argv-leak-proof
 
-          echo "Done."
-        displayName: "Probe: secret present in ARGV?"
-        env:
-          DUMMY_SECRET: $(DUMMY_SECRET)
-
-      - task: PublishPipelineArtifact@1
-        displayName: "Publish: argv-leak artifacts"
-        inputs:
-          targetPath: artifacts-argv
-          artifactName: argv-leak-proof
-          publishLocation: pipeline
-
-  - job: download_and_validate
-    displayName: "Validate: symlink traversal after extraction"
-    dependsOn: seed_and_publish
+# 2) Consumer job that downloads and safely extracts the tarball and
+#    proves there is no path traversal on extraction.
+- stage: ConsumeAndValidate
+  displayName: Download and safely extract symlink tarball
+  dependsOn: BuildAndPublish
+  jobs:
+  - job: validate
+    displayName: Validate safe extraction on Ubuntu
     pool:
-      vmImage: $(VM_IMAGE)
+      vmImage: ubuntu-22.04
     steps:
-      - task: DownloadPipelineArtifact@2
-        displayName: "Download symlink-proof (tar.gz)"
-        inputs:
-          buildType: 'current'
-          artifactName: 'symlink-proof'
-          targetPath: 'dl-symlink'
+    - task: DownloadPipelineArtifact@2
+      displayName: Download symlink-proof
+      inputs:
+        buildType: current
+        artifact: symlink-proof
+        path: $(Pipeline.Workspace)/dl
 
-      - bash: |
-          set -euo pipefail
-          echo "== Unpack symlink payloads =="
-          ls -l dl-symlink
-          mkdir -p dl-symlink/extracted
-          tar -xzf "dl-symlink/$(SYMLINK_ARCHIVE_NAME)" -C dl-symlink/extracted
-          echo "== Inspect extracted files =="
-          mkdir -p artifacts-verify
-          ls -lR dl-symlink/extracted | sed -n '1,300p' | tee artifacts-verify/ls_dl.txt
+    - bash: |
+        set -euo pipefail
+        tgz="$(Pipeline.Workspace)/dl/$(SYMLINK_TGZ)"
+        dest="$(Build.SourcesDirectory)/unpack"
+        mkdir -p "$dest"
+        echo "Extracting to: $dest"
 
-          echo "== Show symlink targets =="
-          find dl-symlink/extracted -type l -print -exec readlink -f {} \; | tee artifacts-verify/readlinks.txt
+        # Do not follow/overwrite dir symlinks; do not change ownership
+        tar --extract \
+            --file "$tgz" \
+            --directory "$dest" \
+            --no-same-owner \
+            --no-overwrite-dir \
+            --keep-old-files
 
-          echo "== Attempt to read via symlinks (top 10 lines) =="
-          for f in \
-            dl-symlink/extracted/abs_to_etc_hosts \
-            dl-symlink/extracted/deep/inside/rel_escape_to_etc_passwd
-          do
-            if [ -e "$f" ]; then
-              {
-                echo "--- BEGIN $f ---"
-                head -n 10 "$f" || true
-                echo "--- END $f ---"
-              } | tee -a artifacts-verify/cat_results.txt
-            else
-              echo "Missing $f" | tee -a artifacts-verify/cat_results.txt
-            fi
-          done
-        displayName: "Unpack & check symlinks"
+        echo "Validating paths stay within $dest"
+        while IFS= read -r path; do
+          rp=$(realpath -m "$dest/$path")
+          case "$rp" in "$dest"/*) : ;; *)
+            echo "Path escape detected: $path -> $rp" >&2
+            exit 1
+          esac
+        done < <(tar -tzf "$tgz" | sed 's#^\./##')
+        echo "OK: no path escapes" | tee "$(Build.SourcesDirectory)/safe-extraction.txt"
+      displayName: Safe extractor & path traversal check
 
-      - task: PublishPipelineArtifact@1
-        displayName: "Publish: downloader verification"
-        inputs:
-          targetPath: artifacts-verify
-          artifactName: symlink-download-proof
-          publishLocation: pipeline
-
-  - job: persistence_check
-    displayName: "Validate: cross-VM persistence & PATH hijack feasibility"
-    dependsOn: seed_and_publish
-    pool:
-      vmImage: $(VM_IMAGE)
-    steps:
-      - bash: |
-          set -euo pipefail
-          echo "== Check for persisted markers from previous job on a fresh VM =="
-          mkdir -p artifacts-persist
-          TC_DIR="${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}"
-          for p in /var/tmp /tmp "$TC_DIR" /usr/local/share ; do
-            fn="$p/.${RUN_MARK}"
-            if [ -f "$fn" ]; then
-              echo "FOUND $fn" | tee -a artifacts-persist/findings.txt
-            else
-              echo "NOT_FOUND $fn" | tee -a artifacts-persist/findings.txt
-            fi
-          done
-
-          echo
-          echo "== Try PATH hijack using toolcache/shadow if it exists =="
-          if [ -d "$TC_DIR/shadow/bin" ]; then
-            export PATH="$TC_DIR/shadow/bin:$PATH"
-            echo "PATH prepended with $TC_DIR/shadow/bin" | tee -a artifacts-persist/findings.txt
-            echo "invocation-test" | tee -a artifacts-persist/echo_out.txt
-            ( node -v || true ) | tee -a artifacts-persist/node_out.txt
-            [ -f "$HOME/shadow-invocations.log" ] && cp "$HOME/shadow-invocations.log" artifacts-persist/ || true
-          else
-            echo "No shadow bin dir present." | tee -a artifacts-persist/findings.txt
-          fi
-        displayName: "Probe: persistence & PATH hijack"
-
-      - task: PublishPipelineArtifact@1
-        displayName: "Publish: persistence findings"
-        inputs:
-          targetPath: artifacts-persist
-          artifactName: persistence-proof
-          publishLocation: pipeline
-
-  - job: imds_from_container
-    displayName: "Probe: IMDS reachability from job container"
-    dependsOn: seed_and_publish
-    pool:
-      vmImage: $(VM_IMAGE)
-    container: ubuntu:22.04
-    steps:
-      - bash: |
-          set -euo pipefail
-          apt-get update -qq
-          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates >/dev/null
-          mkdir -p artifacts-imds
-          echo "== IMDS instance query (should be blocked or require header) ==" | tee -a artifacts-imds/imds.txt
-          set +e
-          curl -i -s --max-time 2 "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | sed -n '1,80p' | tee -a artifacts-imds/imds.txt
-          echo
-          echo "== IMDS with Metadata:true header ==" | tee -a artifacts-imds/imds.txt
-          curl -i -s -H "Metadata: true" --max-time 3 "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | sed -n '1,120p' | tee -a artifacts-imds/imds.txt
-          echo
-          echo "== MSI token probe (likely 400/401 if no identity) ==" | tee -a artifacts-imds/imds.txt
-          curl -i -s -H "Metadata: true" --max-time 3 \
-            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F" \
-            | sed -n '1,80p' | tee -a artifacts-imds/imds.txt
-          set -e
-        displayName: "IMDS inside container"
-
-      - task: PublishPipelineArtifact@1
-        displayName: "Publish: IMDS container probe"
-        inputs:
-          targetPath: artifacts-imds
-          artifactName: imds-container-proof
-          publishLocation: pipeline
+    - task: PublishPipelineArtifact@1
+      displayName: Publish: extractor results
+      inputs:
+        targetPath: $(Build.SourcesDirectory)/safe-extraction.txt
+        artifact: extractor-proof
