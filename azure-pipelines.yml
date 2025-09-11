@@ -2,11 +2,11 @@ name: $(Date:yyyyMMdd).$(Rev:.r)
 
 trigger:
   branches:
-    include: [ main ]
+    include: [main]
 
 pr:
   branches:
-    include: [ main ]
+    include: [main]
 
 variables:
   ARTIFACT_DIR_SYMLINK: '$(Build.SourcesDirectory)/artifacts-symlink'
@@ -16,124 +16,128 @@ variables:
 
 stages:
 - stage: BuildAndPublish
-  displayName: Build, seed, and publish
+  displayName: 'Build, seed, and publish'
   jobs:
   - job: ubuntu
-    displayName: Ubuntu 22.04
+    displayName: 'Ubuntu 22.04'
     pool:
       vmImage: ubuntu-22.04
     steps:
     - checkout: self
       clean: true
 
-    - script: |
-        set -euo pipefail
-        echo "== Host identity & timing =="; date -u; uname -a; id
-
-        echo "== Prepare artifacts tree =="
-        mkdir -p "$(ARTIFACT_DIR_SYMLINK)/deep/inside" "$(ARTIFACT_DIR_TOOLCACHE)" "$(ARTIFACT_DIR_ARGV)"
-        echo "MARK_$(Build.BuildId) $(Build.Repository.Provider) $(Build.SourceVersion)" | tee "$(ARTIFACT_DIR_TOOLCACHE)/MARK.txt"
-
-        echo "== Symlink payloads =="
-        cd "$(ARTIFACT_DIR_SYMLINK)/deep/inside"
-        ln -s ../../../../../etc/passwd rel_escape_to_etc_passwd
-        cd "$(ARTIFACT_DIR_SYMLINK)"
-        find . -maxdepth 3 -type l -ls | tee "$(ARTIFACT_DIR_SYMLINK)/MANIFEST.txt"
-
-        echo "== Pack the symlink payloads (don’t dereference) =="
-        tar -C "$(ARTIFACT_DIR_SYMLINK)" -czf "$(Build.SourcesDirectory)/$(SYMLINK_TGZ)" .
-        ls -l "$(Build.SourcesDirectory)/$(SYMLINK_TGZ)"
-
-        echo "== Toolcache seed (no elevation) =="
-        echo "AGENT_TOOLSDIRECTORY=$AGENT_TOOLSDIRECTORY"
-        for d in /var/tmp /tmp "$AGENT_TOOLSDIRECTORY" /usr/local/share ; do
-          if [ -w "$d" ]; then
-            date -Iseconds > "$d/.MARK_$(Build.BuildId)" || true
-          else
-            echo "no perms for $d" | tee -a "$(ARTIFACT_DIR_TOOLCACHE)/MARK.txt"
-          fi
-        done
-
-        echo "== Secret handling demo (no ARGV leak) =="
-        set +x
-        test -n "$DUMMY_SECRET"
-        sleep 1
-        if ps auxww | grep -F -- "$DUMMY_SECRET" | grep -v grep > "$(ARTIFACT_DIR_ARGV)/ps_secret_matches.txt"; then
-          echo "ERROR: secret string appeared in process args" | tee "$(ARTIFACT_DIR_ARGV)/RESULT.txt"
-          exit 1
-        else
-          echo "OK: secret not found in process args" | tee "$(ARTIFACT_DIR_ARGV)/RESULT.txt"
-        fi
-
-        echo "== Summaries =="
-        cp "$(Build.SourcesDirectory)/$(SYMLINK_TGZ)" "$(ARTIFACT_DIR_SYMLINK)/"
-      displayName: Seed: identify, symlinks, toolcache, and secret init
-      shell: bash
+    - task: Bash@3
+      displayName: 'Seed: identify, symlinks, toolcache, and secret init'
       env:
         DUMMY_SECRET: $(DUMMY_SECRET)
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+          echo "== Host identity & timing =="; date -u; uname -a; id
+
+          echo "== Prepare artifacts tree =="
+          mkdir -p "$(ARTIFACT_DIR_SYMLINK)/deep/inside" "$(ARTIFACT_DIR_TOOLCACHE)" "$(ARTIFACT_DIR_ARGV)"
+          echo "MARK_$(Build.BuildId) $(Build.Repository.Provider) $(Build.SourceVersion)" | tee "$(ARTIFACT_DIR_TOOLCACHE)/MARK.txt"
+
+          echo "== Symlink payloads =="
+          cd "$(ARTIFACT_DIR_SYMLINK)/deep/inside"
+          ln -s ../../../../../etc/passwd rel_escape_to_etc_passwd
+          cd "$(ARTIFACT_DIR_SYMLINK)"
+          find . -maxdepth 3 -type l -ls | tee "$(ARTIFACT_DIR_SYMLINK)/MANIFEST.txt"
+
+          echo "== Pack the symlink payloads (don’t dereference) =="
+          tar -C "$(ARTIFACT_DIR_SYMLINK)" -czf "$(Build.SourcesDirectory)/$(SYMLINK_TGZ)" .
+          ls -l "$(Build.SourcesDirectory)/$(SYMLINK_TGZ)"
+
+          echo "== Toolcache seed (no elevation) =="
+          echo "AGENT_TOOLSDIRECTORY=$AGENT_TOOLSDIRECTORY"
+          for d in /var/tmp /tmp "$AGENT_TOOLSDIRECTORY" /usr/local/share ; do
+            if [ -w "$d" ]; then
+              date -Iseconds > "$d/.MARK_$(Build.BuildId)" || true
+            else
+              echo "no perms for $d" | tee -a "$(ARTIFACT_DIR_TOOLCACHE)/MARK.txt"
+            fi
+          done
+
+          echo "== Secret handling demo (no ARGV leak) =="
+          set +x
+          test -n "$DUMMY_SECRET"
+          sleep 1
+          if ps auxww | grep -F -- "$DUMMY_SECRET" | grep -v grep > "$(ARTIFACT_DIR_ARGV)/ps_secret_matches.txt"; then
+            echo "ERROR: secret string appeared in process args" | tee "$(ARTIFACT_DIR_ARGV)/RESULT.txt"
+            exit 1
+          else
+            echo "OK: secret not found in process args" | tee "$(ARTIFACT_DIR_ARGV)/RESULT.txt"
+          fi
+
+          echo "== Summaries =="
+          cp "$(Build.SourcesDirectory)/$(SYMLINK_TGZ)" "$(ARTIFACT_DIR_SYMLINK)/"
 
     - task: PublishPipelineArtifact@1
-      displayName: Publish: toolcache proof
+      displayName: 'Publish: toolcache proof'
       inputs:
         targetPath: $(ARTIFACT_DIR_TOOLCACHE)
         artifact: toolcache-proof
 
     - task: PublishPipelineArtifact@1
-      displayName: Publish: symlink payloads (as .tgz)
+      displayName: 'Publish: symlink payloads (as .tgz)'
       inputs:
         targetPath: $(Build.SourcesDirectory)/$(SYMLINK_TGZ)
         artifact: symlink-proof
 
     - task: PublishPipelineArtifact@1
-      displayName: Publish: argv leak proof
+      displayName: 'Publish: argv leak proof'
       inputs:
         targetPath: $(ARTIFACT_DIR_ARGV)
         artifact: argv-leak-proof
 
 - stage: ConsumeAndValidate
-  displayName: Download and safely extract symlink tarball
+  displayName: 'Download and safely extract symlink tarball'
   dependsOn: BuildAndPublish
   jobs:
   - job: validate
-    displayName: Validate safe extraction on Ubuntu
+    displayName: 'Validate safe extraction on Ubuntu'
     pool:
       vmImage: ubuntu-22.04
     steps:
     - task: DownloadPipelineArtifact@2
-      displayName: Download symlink-proof
+      displayName: 'Download symlink-proof'
       inputs:
         buildType: current
         artifact: symlink-proof
         path: $(Pipeline.Workspace)/dl
 
-    - script: |
-        set -euo pipefail
-        tgz="$(Pipeline.Workspace)/dl/$(SYMLINK_TGZ)"
-        dest="$(Build.SourcesDirectory)/unpack"
-        mkdir -p "$dest"
-        echo "Extracting to: $dest"
+    - task: Bash@3
+      displayName: 'Safe extractor & path traversal check'
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+          tgz="$(Pipeline.Workspace)/dl/$(SYMLINK_TGZ)"
+          dest="$(Build.SourcesDirectory)/unpack"
+          mkdir -p "$dest"
+          echo "Extracting to: $dest"
 
-        tar --extract \
+          tar --extract \
             --file "$tgz" \
             --directory "$dest" \
             --no-same-owner \
             --no-overwrite-dir \
             --keep-old-files
 
-        echo "Validating paths stay within $dest"
-        tar -tzf "$tgz" | sed 's#^\./##' | while IFS= read -r path; do
-          rp=$(realpath -m "$dest/$path")
-          case "$rp" in "$dest"/*) : ;; *)
-            echo "Path escape detected: $path -> $rp" >&2
-            exit 1
-          esac
-        done
-        echo "OK: no path escapes" | tee "$(Build.SourcesDirectory)/safe-extraction.txt"
-      displayName: Safe extractor & path traversal check
-      shell: bash
+          echo "Validating paths stay within $dest"
+          tar -tzf "$tgz" | sed 's#^\./##' | while IFS= read -r path; do
+            rp=$(realpath -m "$dest/$path")
+            case "$rp" in "$dest"/*) : ;; *)
+              echo "Path escape detected: $path -> $rp" >&2
+              exit 1
+            esac
+          done
+          echo "OK: no path escapes" | tee "$(Build.SourcesDirectory)/safe-extraction.txt"
 
     - task: PublishPipelineArtifact@1
-      displayName: Publish: extractor results
+      displayName: 'Publish: extractor results'
       inputs:
         targetPath: $(Build.SourcesDirectory)/safe-extraction.txt
         artifact: extractor-proof
