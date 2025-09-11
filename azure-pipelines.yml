@@ -7,7 +7,7 @@ pool:
   vmImage: 'ubuntu-22.04'
 
 variables:
-  ART_DIR: $(Build.SourcesDirectory)/artifacts-argv
+  ART_DIR: $(Build.SourcesDirectory)/artifacts-cache
 
 steps:
 - checkout: self
@@ -16,29 +16,34 @@ steps:
 - bash: |
     set -e
     mkdir -p "${ART_DIR}"
-    echo "== Generating synthetic secret and launching a process with it in argv =="
-    SECRET="argv-secret-$$-$(date +%s)"
-    echo "marker=[REDACTED]" > "${ART_DIR}/context.txt"
 
-    # Start a sleeper with the secret in its argv (not env)
-    /bin/sh -c 'sleep 45' "${SECRET}" &
-    SLEEP_PID=$!
-    echo "sleep-pid=${SLEEP_PID}" >> "${ART_DIR}/context.txt"
+    echo "== Tool cache metadata ==" > "${ART_DIR}/toolcache.txt"
+    for p in /opt/hostedtoolcache /usr/local/lib /usr/local/bin; do
+      echo "# ls -la $p" >> "${ART_DIR}/toolcache.txt"
+      ls -la "$p" >> "${ART_DIR}/toolcache.txt" 2>&1 || true
+    done
 
-    sleep 2
-    echo "== ps snapshot =="
-    ps -eo pid,user,args | sed -E 's/argv-secret-[^ ]+/[REDACTED]/g' > "${ART_DIR}/ps-snapshot.txt" || true
+    echo "== Write probe =="
+    date > /opt/hostedtoolcache/__azdo_write_probe.txt 2>> "${ART_DIR}/write-probe.err" || true
+    if [ -f /opt/hostedtoolcache/__azdo_write_probe.txt ]; then
+      echo "wrote-file-success" >> "${ART_DIR}/toolcache.txt"
+      rm -f /opt/hostedtoolcache/__azdo_write_probe.txt || true
+    else
+      echo "write-denied-or-blocked" >> "${ART_DIR}/toolcache.txt"
+    fi
 
-    echo "== /proc cmdline (if present) =="
-    [ -r "/proc/${SLEEP_PID}/cmdline" ] && tr '\0' ' ' < "/proc/${SLEEP_PID}/cmdline" \
-      | sed -E 's/argv-secret-[^ ]+/[REDACTED]/g' > "${ART_DIR}/proc-cmdline.txt" || true
+    echo "== Docker socket & permissions ==" > "${ART_DIR}/docker.sock.txt"
+    ls -la /var/run/docker.sock >> "${ART_DIR}/docker.sock.txt" 2>&1 || true
+    id >> "${ART_DIR}/docker.sock.txt"
+    docker info >> "${ART_DIR}/docker.sock.txt" 2>&1 || true
 
-    # Clean up
-    kill "${SLEEP_PID}" 2>/dev/null || true
-  displayName: Argv leak self-check
+    echo "== Service containers namespace behavior =="
+    docker run --rm alpine:3.20 sh -c 'ps -eo pid,user,comm | head -n 20' \
+      > "${ART_DIR}/service-container-ps.txt" 2>&1 || true
+  displayName: Cache write & docker socket probe
 
 - task: PublishPipelineArtifact@1
-  displayName: Publish argv-leak artifacts
+  displayName: Publish cache/docker artifacts
   inputs:
-    targetPath: $(Build.SourcesDirectory)/artifacts-argv
-    artifact: argv-leak-proof
+    targetPath: $(Build.SourcesDirectory)/artifacts-cache
+    artifact: cache-and-docker-proof
