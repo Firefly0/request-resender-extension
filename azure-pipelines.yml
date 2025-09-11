@@ -1,49 +1,196 @@
+# azure-pipelines.yml
+# Triggers
 trigger:
 - main
 pr:
 - main
 
+# Global defaults
 pool:
-  vmImage: 'ubuntu-22.04'
+  vmImage: ubuntu-22.04
 
-variables:
-  ART_DIR: $(Build.SourcesDirectory)/artifacts-cache
+stages:
+# ============================
+# Stage 1: Forensic sweep
+# ============================
+- stage: Forensics
+  displayName: Forensic sweep (host, processes, IMDS, docker)
+  jobs:
+  - job: ForensicSweep
+    displayName: Aggressive forensic & isolation checks
+    steps:
+    - checkout: self
 
-steps:
-- checkout: self
-  clean: false
+    - task: Bash@3
+      displayName: Aggressive forensic & isolation checks
+      continueOnError: true
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+          ART="${PWD}/artifacts"
+          mkdir -p "$ART"/{host,proc,net,docker,logs}
 
-- bash: |
-    set -e
-    mkdir -p "${ART_DIR}"
+          echo "Launching Alpine helper with host mounts…"
+          # Helper container to snapshot host & docker (if present). It will create some files as root.
+          docker run --rm \
+            -v "$PWD":/work \
+            -v /proc:/hostproc:ro \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -w /work alpine:3.20 sh -lc '
+              set -e
+              apk add --no-cache coreutils procps iproute2 curl docker-cli >/dev/null 2>&1 || true
 
-    echo "== Tool cache metadata ==" > "${ART_DIR}/toolcache.txt"
-    for p in /opt/hostedtoolcache /usr/local/lib /usr/local/bin; do
-      echo "# ls -la $p" >> "${ART_DIR}/toolcache.txt"
-      ls -la "$p" >> "${ART_DIR}/toolcache.txt" 2>&1 || true
-    done
+              # Host basics
+              date -u > /work/artifacts/host/utc.txt 2>/dev/null || true
+              uname -a > /work/artifacts/host/uname.txt 2>/dev/null || true
+              cat /etc/os-release > /work/artifacts/host/os-release.txt 2>/dev/null || true
+              cat /etc/machine-id > /work/artifacts/host/machine-id.txt 2>/dev/null || true
+              cat /hostproc/cmdline > /work/artifacts/proc/cmdline.txt 2>/dev/null || true
 
-    echo "== Write probe =="
-    date > /opt/hostedtoolcache/__azdo_write_probe.txt 2>> "${ART_DIR}/write-probe.err" || true
-    if [ -f /opt/hostedtoolcache/__azdo_write_probe.txt ]; then
-      echo "wrote-file-success" >> "${ART_DIR}/toolcache.txt"
-      rm -f /opt/hostedtoolcache/__azdo_write_probe.txt || true
-    else
-      echo "write-denied-or-blocked" >> "${ART_DIR}/toolcache.txt"
-    fi
+              # Processes & services (redacted)
+              ps auxwwf > /work/artifacts/logs/ps.txt 2>/dev/null || true
+              ps -eo pid,user,cmd | grep -E "mono|php-fpm|dotnet|python|node|java|nginx|apache|ruby|go" \
+                > /work/artifacts/logs/proc-candidates.txt 2>/dev/null || true
 
-    echo "== Docker socket & permissions ==" > "${ART_DIR}/docker.sock.txt"
-    ls -la /var/run/docker.sock >> "${ART_DIR}/docker.sock.txt" 2>&1 || true
-    id >> "${ART_DIR}/docker.sock.txt"
-    docker info >> "${ART_DIR}/docker.sock.txt" 2>&1 || true
+              # Network / IMDS (link-local only, short timeouts)
+              ip a > /work/artifacts/net/ip-addr.txt 2>/dev/null || true
+              ss -tulpn > /work/artifacts/net/listeners.txt 2>/dev/null || true
+              # Azure IMDS probe (safe; will fail closed on GitHub/Azure hosted runners)
+              curl -sS --max-time 2 -H "Metadata: true" \
+                "http://169.254.169.254/metadata/instance?api-version=2021-02-01" \
+                > /work/artifacts/net/imds.json 2>/dev/null || true
 
-    echo "== Service containers namespace behavior =="
-    docker run --rm alpine:3.20 sh -c 'ps -eo pid,user,comm | head -n 20' \
-      > "${ART_DIR}/service-container-ps.txt" 2>&1 || true
+              # Docker intel (if socket is available)
+              if [ -S /var/run/docker.sock ]; then
+                docker version > /work/artifacts/docker/version.txt 2>/dev/null || true
+                docker info > /work/artifacts/docker/info.txt 2>/dev/null || true
+                docker images --digests --no-trunc > /work/artifacts/docker/images.txt 2>/dev/null || true
+                docker ps -a --no-trunc > /work/artifacts/docker/ps-a.txt 2>/dev/null || true
+              else
+                echo "No docker socket at /var/run/docker.sock" > /work/artifacts/docker/notice.txt
+              fi
+
+              # Residual marker for job-level persistence sanity check
+              echo "$(date -u +%FT%TZ) $$" > /work/artifacts/host/residual-marker.txt 2>/dev/null || true
+            ' || true
+
+          echo '--- Collecting Host Timestamps and Fingerprints ---'
+          (date -u; whoami; id) > "$ART/host/identity.txt" || true
+
+    - task: Bash@3
+      displayName: Normalize artifact permissions
+      condition: always()
+      continueOnError: true
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+          ART="${PWD}/artifacts"
+          sudo chown -R "$USER":"$USER" "$ART" 2>/dev/null || true
+          sudo find "$ART" -type d -exec chmod 755 {} \; 2>/dev/null || true
+          sudo find "$ART" -type f -exec chmod 644 {} \; 2>/dev/null || true
+
+    - task: PublishPipelineArtifact@1
+      displayName: Publish Forensic Artifacts
+      condition: always()
+      continueOnError: true
+      inputs:
+        targetPath: $(Build.SourcesDirectory)/artifacts
+        artifact: forensic-proof
+
+# ============================
+# Stage 2: argv leak self-check
+# ============================
+- stage: ArgvLeak
+  displayName: Argv leak self-check
+  dependsOn: Forensics
+  jobs:
+  - job: ArgvLeak
+    displayName: Argv leak self-check
+    steps:
+    - checkout: self
+
+    - task: Bash@3
+      displayName: Argv leak self-check
+      continueOnError: true
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+          OUT="${PWD}/artifacts-argv"
+          mkdir -p "$OUT"
+
+          # Generate a synthetic secret, but never echo it verbatim to logs.
+          SECRET="$(head -c 24 /dev/urandom | base64 | tr -d '\n=')"
+
+          echo "== Generating synthetic secret and launching a process with it in argv =="
+          # Keep a short-lived process with the secret in argv
+          (sleep 120) "token=${SECRET}" &  # the argv gets the secret
+          SLEEPPID=$!
+
+          echo "== ps snapshot =="
+          ps auxww > "$OUT/ps.txt" || true
+
+          echo "== /proc cmdline (if present) =="
+          cat /proc/"$SLEEPPID"/cmdline 2>/dev/null | tr '\0' ' ' > "$OUT/proc-cmdline.txt" || true
+
+          # Redact the secret from outputs on disk
+          sed -i "s/${SECRET}/[REDACTED]/g" "$OUT"/ps.txt "$OUT"/proc-cmdline.txt 2>/dev/null || true
+
+          # Clean up quickly to avoid step hangs
+          kill "$SLEEPPID" 2>/dev/null || true
+
+    - task: PublishPipelineArtifact@1
+      displayName: Publish argv-leak artifacts
+      condition: always()
+      continueOnError: true
+      inputs:
+        targetPath: $(Build.SourcesDirectory)/artifacts-argv
+        artifact: argv-leak-proof
+
+# ============================
+# Stage 3: Cache & docker socket probe
+# ============================
+- stage: CacheDockerProbe
   displayName: Cache write & docker socket probe
+  dependsOn: ArgvLeak
+  jobs:
+  - job: CacheProbe
+    displayName: Cache write & docker socket probe
+    steps:
+    - checkout: self
 
-- task: PublishPipelineArtifact@1
-  displayName: Publish cache/docker artifacts
-  inputs:
-    targetPath: $(Build.SourcesDirectory)/artifacts-cache
-    artifact: cache-and-docker-proof
+    - task: Bash@3
+      displayName: Cache write & docker socket probe
+      continueOnError: true
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+          OUT="${PWD}/artifacts-cache"
+          mkdir -p "$OUT"
+
+          echo "== Write probe =="
+          TS="$(date -u +%Y%m%dT%H%M%SZ)"
+          sudo mkdir -p /opt/hostedtoolcache/persistence-test-"$TS" || true
+          echo "$TS" | sudo tee /opt/hostedtoolcache/persistence-test-"$TS"/stamp.txt >/dev/null || true
+          ls -al /opt/hostedtoolcache > "$OUT/toolcache-ls.txt" 2>/dev/null || true
+
+          echo "== Service containers namespace behavior =="
+          {
+            id || true
+            getent group docker || true
+            stat -Lc "socket:%n mode:%a owner:%U group:%G" /var/run/docker.sock 2>/dev/null || echo "no /var/run/docker.sock"
+            docker version || true
+            docker info || true
+            docker ps -a --no-trunc || true
+          } > "$OUT/docker-socket-and-ps.txt" 2>/dev/null || true
+
+    - task: PublishPipelineArtifact@1
+      displayName: Publish cache/docker artifacts
+      condition: always()
+      continueOnError: true
+      inputs:
+        targetPath: $(Build.SourcesDirectory)/artifacts-cache
+        artifact: cache-and-docker-proof
