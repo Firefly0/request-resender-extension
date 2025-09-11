@@ -1,4 +1,7 @@
-name: $(Date:yyyyMMdd).$(Rev:r)
+# Builds + publishes artifacts (including a symlink tarball) and then
+# downloads/extracts it safely in a separate stage.
+
+name: $(Date:yyyyMMdd).$(Rev:.r)
 
 trigger:
   branches:
@@ -9,13 +12,12 @@ pr:
     include: [ main ]
 
 variables:
-  ARTIFACT_DIR_SYMLINK: $(Build.SourcesDirectory)/artifacts-symlink
-  ARTIFACT_DIR_TOOLCACHE: $(Build.SourcesDirectory)/artifacts-toolcache
-  ARTIFACT_DIR_ARGV: $(Build.SourcesDirectory)/artifacts-argv
-  SYMLINK_TGZ: symlink_payloads.tgz
+  ARTIFACT_DIR_SYMLINK: '$(Build.SourcesDirectory)/artifacts-symlink'
+  ARTIFACT_DIR_TOOLCACHE: '$(Build.SourcesDirectory)/artifacts-toolcache'
+  ARTIFACT_DIR_ARGV: '$(Build.SourcesDirectory)/artifacts-argv'
+  SYMLINK_TGZ: 'symlink_payloads.tgz'
 
 stages:
-# 1) Build/seed and publish artifacts
 - stage: BuildAndPublish
   displayName: Build, seed, and publish
   jobs:
@@ -29,22 +31,19 @@ stages:
 
     - bash: |
         set -euo pipefail
-        echo "== Host identity & timing =="
-        date -u
-        uname -a
-        id
+        echo "== Host identity & timing =="; date -u; uname -a; id
 
         echo "== Prepare artifacts tree =="
-        mkdir -p "$ARTIFACT_DIR_SYMLINK/deep/inside" "$ARTIFACT_DIR_TOOLCACHE" "$ARTIFACT_DIR_ARGV"
-        echo "MARK_$(Build.BuildId) $(Build.Repository.Provider) $(Build.SourceVersion)" | tee "$ARTIFACT_DIR_TOOLCACHE/MARK.txt"
+        mkdir -p "$(ARTIFACT_DIR_SYMLINK)/deep/inside" "$(ARTIFACT_DIR_TOOLCACHE)" "$(ARTIFACT_DIR_ARGV)"
+        echo "MARK_$(Build.BuildId) $(Build.Repository.Provider) $(Build.SourceVersion)" | tee "$(ARTIFACT_DIR_TOOLCACHE)/MARK.txt"
 
         echo "== Symlink payloads =="
-        (cd "$ARTIFACT_DIR_SYMLINK/deep/inside" && ln -s ../../../../../etc/passwd rel_escape_to_etc_passwd)
-        (cd "$ARTIFACT_DIR_SYMLINK" && find . -maxdepth 3 -type l -ls) | tee "$ARTIFACT_DIR_SYMLINK/MANIFEST.txt"
+        (cd "$(ARTIFACT_DIR_SYMLINK)/deep/inside" && ln -s ../../../../../etc/passwd rel_escape_to_etc_passwd)
+        (cd "$(ARTIFACT_DIR_SYMLINK)" && find . -maxdepth 3 -type l -ls) | tee "$(ARTIFACT_DIR_SYMLINK)/MANIFEST.txt"
 
         echo "== Pack the symlink payloads (don’t dereference) =="
-        (cd "$ARTIFACT_DIR_SYMLINK" && tar -czf "../$SYMLINK_TGZ" .)
-        ls -l "$(Build.SourcesDirectory)/$SYMLINK_TGZ"
+        (cd "$(ARTIFACT_DIR_SYMLINK)" && tar -czf "../$(SYMLINK_TGZ)" .)
+        ls -l "$(Build.SourcesDirectory)/$(SYMLINK_TGZ)"
 
         echo "== Toolcache seed (no elevation) =="
         echo "AGENT_TOOLSDIRECTORY=$AGENT_TOOLSDIRECTORY"
@@ -52,31 +51,29 @@ stages:
           if [ -w "$d" ]; then
             echo "wrote $(date -Iseconds)" > "$d/.MARK_$(Build.BuildId)" || true
           else
-            echo "no perms for $d" | tee -a "$ARTIFACT_DIR_TOOLCACHE/MARK.txt"
+            echo "no perms for $d" | tee -a "$(ARTIFACT_DIR_TOOLCACHE)/MARK.txt"
           fi
         done
 
         echo "== Secret handling demo (no ARGV leak) =="
-        set +x  # never echo commands when touching secrets
+        set +x
         : "${DUMMY_SECRET:?DUMMY_SECRET pipeline variable must be set}"
 
-        # Simulate a tool that reads secret from env (no CLI args):
         python - <<'PY'
         import os, time
         assert os.environ.get("DUMMY_SECRET"), "missing secret"
         time.sleep(1)
         PY
 
-        echo "argv-check: scan process table to ensure the secret is not present"
-        if ps auxww | grep -F -- "$DUMMY_SECRET" | grep -v grep > "$ARTIFACT_DIR_ARGV/ps_secret_matches.txt"; then
-          echo "ERROR: secret string appeared in process args" | tee "$ARTIFACT_DIR_ARGV/RESULT.txt"
+        if ps auxww | grep -F -- "$(DUMMY_SECRET)" | grep -v grep > "$(ARTIFACT_DIR_ARGV)/ps_secret_matches.txt"; then
+          echo "ERROR: secret string appeared in process args" | tee "$(ARTIFACT_DIR_ARGV)/RESULT.txt"
           exit 1
         else
-          echo "OK: secret not found in process args" | tee "$ARTIFACT_DIR_ARGV/RESULT.txt"
+          echo "OK: secret not found in process args" | tee "$(ARTIFACT_DIR_ARGV)/RESULT.txt"
         fi
 
         echo "== Summaries =="
-        cp "$(Build.SourcesDirectory)/$SYMLINK_TGZ" "$ARTIFACT_DIR_SYMLINK/"
+        cp "$(Build.SourcesDirectory)/$(SYMLINK_TGZ)" "$(ARTIFACT_DIR_SYMLINK)/"
       displayName: Seed: identify, symlinks, toolcache, and secret init
       env:
         DUMMY_SECRET: $(DUMMY_SECRET)
@@ -99,8 +96,6 @@ stages:
         targetPath: $(ARTIFACT_DIR_ARGV)
         artifact: argv-leak-proof
 
-# 2) Consumer job that downloads and safely extracts the tarball and
-#    proves there is no path traversal on extraction.
 - stage: ConsumeAndValidate
   displayName: Download and safely extract symlink tarball
   dependsOn: BuildAndPublish
@@ -124,7 +119,6 @@ stages:
         mkdir -p "$dest"
         echo "Extracting to: $dest"
 
-        # Do not follow/overwrite dir symlinks; do not change ownership
         tar --extract \
             --file "$tgz" \
             --directory "$dest" \
